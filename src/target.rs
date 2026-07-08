@@ -111,6 +111,22 @@ impl SceneTarget {
         })
     }
 
+    /// The target's rendered color view — used to read a finished target back
+    /// as a material texture input (e.g. binding a scene or bloom pass into a
+    /// composite material). Sampleable because the scene texture already
+    /// carries `TEXTURE_BINDING` usage alongside `RENDER_ATTACHMENT`.
+    pub(crate) fn color_view(&self) -> &TextureView {
+        &self.view
+    }
+
+    /// The Nearest sampler paired with this target's color texture. Reused so
+    /// binding a target as a material input does not need a fresh sampler per
+    /// bind; `TextureView`/`Sampler` are cheap reference-counted handles, so
+    /// cloning does not duplicate GPU memory.
+    pub(crate) fn color_sampler(&self) -> &Sampler {
+        &self.sampler
+    }
+
     /// Blit the finished target onto `surface_view` with the Nearest sampler,
     /// upscaling the logical image to the window.
     pub(crate) fn blit_to(&self, encoder: &mut CommandEncoder, surface_view: &TextureView) {

@@ -8,7 +8,7 @@ use wgpu::{CommandEncoderDescriptor, TextureViewDescriptor};
 use crate::color::{Color, Point, Rect2, SpriteParams, TextStyle};
 use crate::sprite::SpriteInstance;
 use crate::target::SceneTarget;
-use crate::{Context, FontId, MaterialId, TextureId, UniformValue, Vk2dError};
+use crate::{Context, FontId, MaterialId, TargetId, TextureId, UniformValue, Vk2dError};
 
 fn wgpu_color(c: Color) -> wgpu::Color {
     wgpu::Color {
@@ -33,10 +33,27 @@ enum DrawCmd {
     Text(FontId),
 }
 
-/// A frame in progress. Draw into it, then call [`Frame::present`].
+/// Where a [`Frame`] renders its scene pass to, and how it finishes.
+///
+/// A frame either targets the swapchain (the normal `begin_frame` path: the
+/// scene target is blitted to an acquired surface texture, which `present()`
+/// then shows) or a chosen offscreen [`TargetId`] (`begin_target_frame`: the
+/// scene pass renders straight into that target and the frame finishes by
+/// submitting the encoder — there is no swapchain acquire, blit, or present).
+enum FrameDest {
+    /// Render into `targets[0]` and blit to `surface_texture` on finish.
+    Swapchain {
+        surface_texture: wgpu::SurfaceTexture,
+    },
+    /// Render straight into `targets[index]`; finishing only submits.
+    Offscreen { index: usize },
+}
+
+/// A frame in progress. Draw into it, then call [`Frame::present`] (swapchain
+/// frames) or [`Frame::finish`] (offscreen target frames — does not present).
 pub struct Frame<'ctx> {
     ctx: &'ctx mut Context,
-    surface_texture: wgpu::SurfaceTexture,
+    dest: FrameDest,
     /// Background clear colour for the scene pass.
     clear: Color,
     /// Sprite runs in submission order: each is a texture + its instances. A run
@@ -70,7 +87,39 @@ impl Context {
         }
         Ok(Frame {
             ctx: self,
-            surface_texture,
+            dest: FrameDest::Swapchain { surface_texture },
+            clear,
+            runs: Vec::new(),
+            cmds: Vec::new(),
+        })
+    }
+
+    /// Begin a frame that renders into the offscreen `target` instead of the
+    /// swapchain — the multi-pass entry point (bloom ping-pong, scene-reading
+    /// post-process). `Err(Vk2dError::UnknownTarget)` if `target` was never
+    /// created via [`Context::create_target`]; never panics.
+    ///
+    /// The returned [`Frame`] does **not** present to the window: finish it
+    /// with [`Frame::finish`] (or drop it, which finishes implicitly), then
+    /// read the target back via [`Frame::bind_material_target`] in a later
+    /// pass. Calling [`Frame::present`] on a target frame is also safe — it
+    /// finishes the same way and simply has nothing to show.
+    pub fn begin_target_frame(
+        &mut self,
+        target: TargetId,
+        clear: Color,
+    ) -> Result<Frame<'_>, Vk2dError> {
+        let index = target.0 as usize;
+        if index >= self.targets.len() {
+            return Err(Vk2dError::UnknownTarget);
+        }
+        self.shapes.begin_frame();
+        for font in &mut self.fonts {
+            font.begin_frame();
+        }
+        Ok(Frame {
+            ctx: self,
+            dest: FrameDest::Offscreen { index },
             clear,
             runs: Vec::new(),
             cmds: Vec::new(),
@@ -209,6 +258,17 @@ impl<'ctx> Frame<'ctx> {
         self.ctx.set_material_texture(material, slot, texture);
     }
 
+    /// Bind a render target's finished color texture to a named sampler slot
+    /// of `material` for this frame — reads back a prior offscreen pass (e.g.
+    /// a bloom target) as this frame's material input. Unknown material,
+    /// slot name, or target id is a no-op (no panic). The target must already
+    /// have been rendered and finished in an earlier frame (or an earlier
+    /// pass within the same frame sequence) — binding does not itself
+    /// schedule any rendering.
+    pub fn bind_material_target(&mut self, material: MaterialId, slot: &str, target: TargetId) {
+        self.ctx.set_material_target(material, slot, target);
+    }
+
     /// Draw a material fullscreen into the scene (the effect shader controls its
     /// own coverage — e.g. a quad vignette). Draws in submission order.
     pub fn material_fullscreen(&mut self, material: MaterialId) {
@@ -217,17 +277,36 @@ impl<'ctx> Frame<'ctx> {
         }
     }
 
-    /// Finish the frame: record the scene pass (draws in submission order),
-    /// blit the scene to the swapchain with a Nearest upscale, and present.
+    /// Finish the frame: record the scene pass (draws in submission order).
+    ///
+    /// - Swapchain frames (from [`Context::begin_frame`]): blit the scene to
+    ///   the swapchain with a Nearest upscale, then present.
+    /// - Offscreen target frames (from [`Context::begin_target_frame`]):
+    ///   submit only — there is no swapchain to blit or present. Calling
+    ///   `present` on a target frame is safe (matches the type's normal
+    ///   finishing verb) but shows nothing; see [`Frame::finish`] for the
+    ///   offscreen-flavoured name.
     pub fn present(self) {
         let (_ctx, surface_texture) = self.render_scene();
-        surface_texture.present();
+        if let Some(surface_texture) = surface_texture {
+            surface_texture.present();
+        }
+    }
+
+    /// Finish an offscreen target frame (from [`Context::begin_target_frame`]):
+    /// records the scene pass into its target and submits. An alias for
+    /// [`Frame::present`] with a name that reads correctly for target frames,
+    /// which never touch the swapchain.
+    pub fn finish(self) {
+        self.present();
     }
 
     /// Finish the frame like [`Frame::present`], but paint an egui overlay onto
     /// the swapchain (over the scene) before presenting. The scene and overlay
     /// share one surface texture and are presented together. `build` constructs
-    /// the UI. (Feature `egui`.)
+    /// the UI. (Feature `egui`.) Only meaningful for swapchain frames; called on
+    /// an offscreen target frame it finishes the same way and skips painting
+    /// (there is no surface to paint onto).
     #[cfg(feature = "egui")]
     pub fn present_with_egui(
         self,
@@ -237,8 +316,11 @@ impl<'ctx> Frame<'ctx> {
     ) {
         // Record + submit the scene exactly as `present`, but keep the surface
         // texture un-presented so the overlay can paint onto it.
-        let surface_view = self.render_scene();
-        let (ctx, surface_texture) = surface_view;
+        let (ctx, surface_texture) = self.render_scene();
+        let Some(surface_texture) = surface_texture else {
+            // Offscreen target frame: nothing to paint an overlay onto.
+            return;
+        };
         let view = surface_texture
             .texture
             .create_view(&TextureViewDescriptor::default());
@@ -254,13 +336,14 @@ impl<'ctx> Frame<'ctx> {
         surface_texture.present();
     }
 
-    /// Record + submit the scene pass and blit (no present); return the context
-    /// and the un-presented surface texture. Shared by `present` and
-    /// `present_with_egui`.
-    fn render_scene(self) -> (&'ctx mut Context, wgpu::SurfaceTexture) {
+    /// Record + submit the scene pass (and, for swapchain frames, the blit);
+    /// return the context and the un-presented surface texture (`None` for an
+    /// offscreen target frame — there is nothing to present). Shared by
+    /// `present` and `present_with_egui`.
+    fn render_scene(self) -> (&'ctx mut Context, Option<wgpu::SurfaceTexture>) {
         let Frame {
             ctx,
-            surface_texture,
+            dest,
             clear,
             runs,
             cmds,
@@ -284,16 +367,18 @@ impl<'ctx> Frame<'ctx> {
             .collect();
         let slots = ctx.sprites.stage(&ctx.device, &ctx.queue, &staged, ls);
 
-        let surface_view = surface_texture
-            .texture
-            .create_view(&TextureViewDescriptor::default());
+        let target_index = match &dest {
+            FrameDest::Swapchain { .. } => 0,
+            FrameDest::Offscreen { index } => *index,
+        };
+
         let mut encoder = ctx
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("vk2d.frame.encoder"),
             });
         {
-            let scene: &SceneTarget = &ctx.targets[0];
+            let scene: &SceneTarget = &ctx.targets[target_index];
             let mut pass = scene.begin_scene_pass(&mut encoder, wgpu_color(clear));
             for cmd in &cmds {
                 match cmd {
@@ -320,7 +405,18 @@ impl<'ctx> Frame<'ctx> {
                 }
             }
         }
-        ctx.targets[0].blit_to(&mut encoder, &surface_view);
+
+        let surface_texture = match dest {
+            FrameDest::Swapchain { surface_texture } => {
+                let surface_view = surface_texture
+                    .texture
+                    .create_view(&TextureViewDescriptor::default());
+                ctx.targets[target_index].blit_to(&mut encoder, &surface_view);
+                Some(surface_texture)
+            }
+            FrameDest::Offscreen { .. } => None,
+        };
+
         ctx.queue.submit(std::iter::once(encoder.finish()));
         (ctx, surface_texture)
     }

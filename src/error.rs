@@ -21,6 +21,10 @@ pub enum Vk2dError {
     },
     /// The surface was lost and could not be reconfigured.
     SurfaceLost,
+    /// [`crate::Context::begin_target_frame`] was called with a [`crate::TargetId`]
+    /// that has no corresponding offscreen target (never created via
+    /// [`crate::Context::create_target`]).
+    UnknownTarget,
 }
 
 impl std::fmt::Display for Vk2dError {
@@ -31,6 +35,7 @@ impl std::fmt::Display for Vk2dError {
             Self::DeviceRequest(m) => write!(f, "device request failed: {m}"),
             Self::ShaderCompile { message } => write!(f, "shader compile error: {message}"),
             Self::SurfaceLost => write!(f, "surface lost"),
+            Self::UnknownTarget => write!(f, "unknown render target id"),
         }
     }
 }

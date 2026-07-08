@@ -263,6 +263,34 @@ impl Context {
         }
     }
 
+    /// Bind a render target's finished color texture to a declared texture
+    /// slot (by name) of `material` — the multi-pass hookup (bloom ping-pong,
+    /// scene-reading post-process). Mirrors [`Context::set_material_texture`]
+    /// but sources the view/sampler from `targets[target]` instead of the
+    /// texture registry. Unknown material id, unknown slot name, or unknown
+    /// target id is a no-op (the no-panic contract).
+    pub(crate) fn set_material_target(
+        &mut self,
+        material: MaterialId,
+        name: &str,
+        target: TargetId,
+    ) {
+        let Some(scene) = self.targets.get(target.0 as usize) else {
+            return;
+        };
+        // Clone the view/sampler: cheap reference-counted handles (see
+        // `set_material_texture`), not a GPU memory duplication.
+        let view = scene.color_view().clone();
+        let sampler = scene.color_sampler().clone();
+        let fallback = self
+            .fallback_texture
+            .get_or_insert_with(|| create_fallback_texture(&self.device, &self.queue));
+        let fallback = (&fallback.0, &fallback.1);
+        if let Some(mat) = self.materials.get_mut(material.0 as usize) {
+            mat.set_texture(&self.device, name, view, sampler, fallback);
+        }
+    }
+
     /// Upload decoded RGBA bytes (`width`x`height`, 4 bytes/texel, row-major) as
     /// a texture and return its handle. The app decodes the image; vk2d never
     /// loads files.

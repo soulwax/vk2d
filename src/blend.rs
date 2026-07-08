@@ -4,10 +4,11 @@
 use wgpu::{BlendComponent, BlendFactor, BlendOperation, BlendState};
 
 /// How a draw composites onto the target.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum BlendMode {
     /// Standard source-over-destination alpha compositing:
     /// `Src·SrcA + Dst·(1−SrcA)`.
+    #[default]
     Alpha,
     /// Alpha-weighted additive: `Src·SrcA + Dst·1`. Light accumulates without
     /// darkening what is beneath it — the glow mode.

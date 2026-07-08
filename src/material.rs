@@ -57,6 +57,7 @@ impl UniformValue {
 }
 
 /// Everything needed to build one material.
+#[derive(Default)]
 pub struct MaterialDesc<'a> {
     /// WGSL source. Must define `vs_main` + `fs_main` and a uniform block at
     /// `@group(0) @binding(0)` matching `uniforms`.
@@ -67,6 +68,14 @@ pub struct MaterialDesc<'a> {
     /// its own 16-byte-aligned slot (std140-friendly), so the app pushes values
     /// by name without hand-writing offsets.
     pub uniforms: &'a [(&'a str, UniformType)],
+    /// Optional shared prelude prepended before compilation (e.g. a helper
+    /// library). `None` compiles `wgsl` unchanged. The body may reference any
+    /// item the prelude declares.
+    pub prelude: Option<&'a str>,
+    /// Names of sampled textures this material declares beyond its uniform
+    /// block, in binding order (see [`crate::Frame::bind_material_texture`]).
+    /// Empty for uniform-only materials.
+    pub textures: &'a [&'a str],
 }
 
 /// Assign each declared uniform its own 16-byte-aligned slot and return a
@@ -86,6 +95,11 @@ pub(crate) struct Material {
     pub bind_group: BindGroup,
     pub uniform_buffer: Buffer,
     pub offsets: HashMap<String, u32>,
+    /// Declared texture names from `MaterialDesc::textures`, in binding order.
+    /// Not yet consumed for binding/rendering — that lands with texture
+    /// materials (Task A2).
+    #[allow(dead_code)] // consumed by texture materials (Task A2)
+    pub(crate) texture_names: Vec<String>,
 }
 
 impl Material {
@@ -95,7 +109,11 @@ impl Material {
         desc: &MaterialDesc,
         target_format: TextureFormat,
     ) -> Result<Self, Vk2dError> {
-        let spirv = compile_wgsl_to_spirv(desc.wgsl)?;
+        let source = match desc.prelude {
+            Some(prelude) => std::borrow::Cow::Owned(format!("{prelude}\n{}", desc.wgsl)),
+            None => std::borrow::Cow::Borrowed(desc.wgsl),
+        };
+        let spirv = compile_wgsl_to_spirv(&source)?;
         let module = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("vk2d.material.shader"),
             source: ShaderSource::SpirV(std::borrow::Cow::Owned(spirv)),
@@ -155,11 +173,14 @@ impl Material {
             cache: None,
         });
 
+        let texture_names = desc.textures.iter().map(|s| (*s).to_string()).collect();
+
         Ok(Self {
             pipeline,
             bind_group,
             uniform_buffer,
             offsets,
+            texture_names,
         })
     }
 

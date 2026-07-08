@@ -128,6 +128,8 @@ impl ApplicationHandler for App {
                 wgsl: GRADIENT_WGSL,
                 blend: vk2d::BlendMode::Additive,
                 uniforms: &[("time", UniformType::Vec4)],
+                prelude: None,
+                textures: &[],
             })
             .expect("gradient material compiles");
         self.ctx = Some(ctx);

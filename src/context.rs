@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use wgpu::{
     Backends, Device, DeviceDescriptor, Instance, InstanceDescriptor, PowerPreference, Queue,
-    RequestAdapterOptions, Surface, SurfaceConfiguration, TextureUsages,
+    RequestAdapterOptions, Sampler, Surface, SurfaceConfiguration, TextureUsages, TextureView,
 };
 use winit::window::Window;
 
-use crate::material::{Material, MaterialDesc};
+use crate::material::{Material, MaterialDesc, create_fallback_texture};
 use crate::sprite::{Filter, GpuTexture, SpriteBatch, create_gpu_texture};
 use crate::target::{SCENE_FORMAT, SceneTarget};
 use crate::text::TextRenderer;
@@ -78,6 +78,11 @@ pub struct Context {
     pub(crate) shapes: crate::shapes::ShapeBatch,
     /// Text renderers, indexed by `FontId` (one baked atlas each).
     pub(crate) fonts: Vec<TextRenderer>,
+    /// Shared 1x1 white texture substituted into any declared material
+    /// texture slot that hasn't been bound yet. Built lazily on first use by
+    /// [`Context::fallback_texture`] (most apps never touch texture
+    /// materials, so most contexts never pay for it).
+    fallback_texture: Option<(TextureView, Sampler)>,
 }
 
 impl Context {
@@ -146,7 +151,16 @@ impl Context {
             materials: Vec::new(),
             shapes,
             fonts: Vec::new(),
+            fallback_texture: None,
         })
+    }
+
+    /// The shared 1x1 white fallback view/sampler, created on first use.
+    fn fallback_texture(&mut self) -> (&TextureView, &Sampler) {
+        let (view, sampler) = self
+            .fallback_texture
+            .get_or_insert_with(|| create_fallback_texture(&self.device, &self.queue));
+        (view, sampler)
     }
 
     /// Bake a TTF (decoded bytes) into a glyph atlas at `atlas_px` and register
@@ -199,9 +213,17 @@ impl Context {
 
     /// Compile a WGSL material and register it. The WGSL is compiled to SPIR-V
     /// now (at load), so a shader error is returned here — not at first draw.
-    /// Materials render into the scene target (scene format).
+    /// Materials render into the scene target (scene format). Any declared
+    /// [`MaterialDesc::textures`] slot starts bound to the shared 1x1 white
+    /// fallback until [`Context::set_material_texture`] binds a real texture.
     pub fn load_material(&mut self, desc: MaterialDesc) -> Result<MaterialId, Vk2dError> {
-        let material = Material::new(&self.device, &desc, SCENE_FORMAT)?;
+        self.fallback_texture();
+        let fallback = self
+            .fallback_texture
+            .as_ref()
+            .map(|(v, s)| (v, s))
+            .expect("fallback_texture() just initialized this");
+        let material = Material::new(&self.device, &desc, SCENE_FORMAT, fallback)?;
         let id = MaterialId(self.materials.len() as u32);
         self.materials.push(material);
         Ok(id)
@@ -212,6 +234,32 @@ impl Context {
     pub fn set_material_uniform(&self, material: MaterialId, name: &str, value: UniformValue) {
         if let Some(mat) = self.materials.get(material.0 as usize) {
             mat.set_uniform(&self.queue, name, value);
+        }
+    }
+
+    /// Bind a loaded texture to a declared texture slot (by name) of
+    /// `material`. Resolves `texture` to its GPU view/sampler and rebuilds the
+    /// material's bind group. Unknown material id, unknown slot name, or
+    /// unknown texture id is a no-op (the no-panic contract).
+    pub(crate) fn set_material_texture(
+        &mut self,
+        material: MaterialId,
+        name: &str,
+        texture: TextureId,
+    ) {
+        let Some(gpu) = self.textures.get(texture.0 as usize) else {
+            return;
+        };
+        // Clone the view/sampler: wgpu's `TextureView`/`Sampler` are cheap
+        // reference-counted handles, so this does not duplicate GPU memory.
+        let view = gpu.view.clone();
+        let sampler = gpu.sampler.clone();
+        let fallback = self
+            .fallback_texture
+            .get_or_insert_with(|| create_fallback_texture(&self.device, &self.queue));
+        let fallback = (&fallback.0, &fallback.1);
+        if let Some(mat) = self.materials.get_mut(material.0 as usize) {
+            mat.set_texture(&self.device, name, view, sampler, fallback);
         }
     }
 

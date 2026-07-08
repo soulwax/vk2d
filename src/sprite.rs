@@ -12,11 +12,11 @@ use wgpu::{
     BufferAddress, BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites, Device, Extent3d,
     FilterMode, FragmentState, FrontFace, IndexFormat, MultisampleState,
     PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, PrimitiveTopology, Queue,
-    RenderPass, RenderPipeline, RenderPipelineDescriptor, SamplerBindingType, SamplerDescriptor,
-    ShaderModuleDescriptor, ShaderSource, ShaderStages, TexelCopyBufferLayout,
+    RenderPass, RenderPipeline, RenderPipelineDescriptor, Sampler, SamplerBindingType,
+    SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, TexelCopyBufferLayout,
     TexelCopyTextureInfo, TextureAspect, TextureDescriptor, TextureDimension, TextureFormat,
-    TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension, VertexAttribute,
-    VertexBufferLayout, VertexFormat, VertexState, VertexStepMode,
+    TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension,
+    VertexAttribute, VertexBufferLayout, VertexFormat, VertexState, VertexStepMode,
 };
 
 use crate::blend::BlendMode;
@@ -85,12 +85,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// A GPU texture in the registry: its bind group (for the sprite pipeline) and
-/// pixel dimensions (for uv computation).
+/// A GPU texture in the registry: its bind group (for the sprite pipeline),
+/// pixel dimensions (for uv computation), and the raw view + sampler so other
+/// consumers (materials, see `crate::material`) can rebind it into their own
+/// bind-group layouts without recreating the texture.
 pub(crate) struct GpuTexture {
     pub bind_group: BindGroup,
     pub width: f32,
     pub height: f32,
+    /// The texture's view, reused by material texture-slot binding.
+    pub view: TextureView,
+    /// The texture's sampler, reused by material texture-slot binding.
+    pub sampler: Sampler,
 }
 
 /// The shared sprite pipeline + per-frame geometry buffers. One instance drives
@@ -288,6 +294,8 @@ pub(crate) fn create_gpu_texture(
         bind_group,
         width: width as f32,
         height: height as f32,
+        view,
+        sampler,
     }
 }
 

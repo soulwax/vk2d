@@ -203,6 +203,12 @@ impl<'ctx> Frame<'ctx> {
         self.ctx.set_material_uniform(material, name, value);
     }
 
+    /// Bind a loaded texture to a named sampler slot of `material` for this
+    /// frame. Unknown material or slot name is a no-op (no panic).
+    pub fn bind_material_texture(&mut self, material: MaterialId, slot: &str, texture: TextureId) {
+        self.ctx.set_material_texture(material, slot, texture);
+    }
+
     /// Draw a material fullscreen into the scene (the effect shader controls its
     /// own coverage — e.g. a quad vignette). Draws in submission order.
     pub fn material_fullscreen(&mut self, material: MaterialId) {

@@ -6,12 +6,15 @@
 use std::collections::HashMap;
 
 use wgpu::{
-    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferDescriptor, BufferUsages,
-    ColorTargetState, ColorWrites, Device, FragmentState, MultisampleState,
-    PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, PrimitiveTopology, Queue,
-    RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages,
-    TextureFormat, VertexState,
+    AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
+    BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, Buffer,
+    BufferBindingType, BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites, Device,
+    Extent3d, FilterMode, FragmentState, MultisampleState, PipelineCompilationOptions,
+    PipelineLayoutDescriptor, PrimitiveState, PrimitiveTopology, Queue, RenderPipeline,
+    RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor,
+    ShaderModuleDescriptor, ShaderSource, ShaderStages, TextureAspect, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView,
+    TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 
 use crate::Vk2dError;
@@ -75,6 +78,13 @@ pub struct MaterialDesc<'a> {
     /// Names of sampled textures this material declares beyond its uniform
     /// block, in binding order (see [`crate::Frame::bind_material_texture`]).
     /// Empty for uniform-only materials.
+    ///
+    /// Binding contract: the uniform block stays at `@group(0) @binding(0)`.
+    /// For the i-th name in `textures`, the WGSL must declare a
+    /// `texture_2d<f32>` at `@group(0) @binding(1 + 2*i)` and a `sampler` at
+    /// `@group(0) @binding(2 + 2*i)`. An unbound slot samples a shared 1x1
+    /// white fallback texture until the app calls
+    /// [`crate::Frame::bind_material_texture`].
     pub textures: &'a [&'a str],
 }
 
@@ -89,25 +99,42 @@ pub(crate) fn uniform_offsets(uniforms: &[(&str, UniformType)]) -> HashMap<Strin
     map
 }
 
-/// A compiled material: its pipeline, uniform buffer, and name->offset map.
+/// A texture + sampler pair a material can bind into one of its declared
+/// texture slots. Owned copies (not references) so the material can rebuild
+/// its bind group at any time without borrowing the texture registry.
+struct BoundTexture {
+    view: TextureView,
+    sampler: Sampler,
+}
+
+/// A compiled material: its pipeline, uniform buffer, name->offset map, and
+/// (if it declares any) its texture slots.
 pub(crate) struct Material {
     pub pipeline: RenderPipeline,
     pub bind_group: BindGroup,
     pub uniform_buffer: Buffer,
     pub offsets: HashMap<String, u32>,
-    /// Declared texture names from `MaterialDesc::textures`, in binding order.
-    /// Not yet consumed for binding/rendering — that lands with texture
-    /// materials (Task A2).
-    #[allow(dead_code)] // consumed by texture materials (Task A2)
+    /// Declared texture names from `MaterialDesc::textures`, in binding order
+    /// (slot i binds at `@binding(1+2i)`/`@binding(2+2i)`).
     pub(crate) texture_names: Vec<String>,
+    /// The bind-group layout backing `bind_group`, kept so the bind group can
+    /// be rebuilt when a texture slot changes.
+    bind_group_layout: BindGroupLayout,
+    /// Per-slot bound texture, in the same order as `texture_names`. `None`
+    /// until the app calls `set_texture`; the fallback is substituted when
+    /// rebuilding the bind group.
+    bound_textures: Vec<Option<BoundTexture>>,
 }
 
 impl Material {
     /// Compile the WGSL to SPIR-V and build the pipeline + uniform buffer.
+    /// `fallback` is the shared 1x1 white view/sampler substituted into any
+    /// declared texture slot that hasn't been bound yet.
     pub(crate) fn new(
         device: &Device,
         desc: &MaterialDesc,
         target_format: TextureFormat,
+        fallback: (&TextureView, &Sampler),
     ) -> Result<Self, Vk2dError> {
         let source = match desc.prelude {
             Some(prelude) => std::borrow::Cow::Owned(format!("{prelude}\n{}", desc.wgsl)),
@@ -128,15 +155,17 @@ impl Material {
             mapped_at_creation: false,
         });
 
-        let bind_group_layout = create_uniform_layout(device);
-        let bind_group = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("vk2d.material.bind_group"),
-            layout: &bind_group_layout,
-            entries: &[BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
-        });
+        let texture_names: Vec<String> = desc.textures.iter().map(|s| (*s).to_string()).collect();
+        let bind_group_layout = create_bind_group_layout(device, texture_names.len());
+        let bound_textures: Vec<Option<BoundTexture>> =
+            (0..texture_names.len()).map(|_| None).collect();
+        let bind_group = build_bind_group(
+            device,
+            &bind_group_layout,
+            &uniform_buffer,
+            &bound_textures,
+            fallback,
+        );
 
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("vk2d.material.pipeline_layout"),
@@ -173,14 +202,14 @@ impl Material {
             cache: None,
         });
 
-        let texture_names = desc.textures.iter().map(|s| (*s).to_string()).collect();
-
         Ok(Self {
             pipeline,
             bind_group,
             uniform_buffer,
             offsets,
             texture_names,
+            bind_group_layout,
+            bound_textures,
         })
     }
 
@@ -191,22 +220,156 @@ impl Material {
             queue.write_buffer(&self.uniform_buffer, offset as u64, &value.to_le_bytes());
         }
     }
+
+    /// Bind `view`/`sampler` to the declared texture slot named `name` and
+    /// rebuild the bind group. Unknown slot names are ignored (the no-panic
+    /// contract) — the caller (`Context::set_material_texture`) is expected to
+    /// have already resolved the `TextureId`.
+    pub(crate) fn set_texture(
+        &mut self,
+        device: &Device,
+        name: &str,
+        view: TextureView,
+        sampler: Sampler,
+        fallback: (&TextureView, &Sampler),
+    ) {
+        let Some(slot) = self.texture_names.iter().position(|n| n == name) else {
+            return;
+        };
+        self.bound_textures[slot] = Some(BoundTexture { view, sampler });
+        self.bind_group = build_bind_group(
+            device,
+            &self.bind_group_layout,
+            &self.uniform_buffer,
+            &self.bound_textures,
+            fallback,
+        );
+    }
 }
 
-fn create_uniform_layout(device: &Device) -> BindGroupLayout {
-    device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: Some("vk2d.material.uniform_layout"),
-        entries: &[BindGroupLayoutEntry {
-            binding: 0,
-            visibility: ShaderStages::VERTEX_FRAGMENT,
-            ty: BindingType::Buffer {
-                ty: BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
+/// Build (or rebuild) the material's bind group: the uniform buffer at
+/// binding 0, then each declared texture slot's view/sampler pair (or the
+/// shared fallback for an unbound slot) at `1+2i`/`2+2i`.
+fn build_bind_group(
+    device: &Device,
+    layout: &BindGroupLayout,
+    uniform_buffer: &Buffer,
+    bound_textures: &[Option<BoundTexture>],
+    fallback: (&TextureView, &Sampler),
+) -> BindGroup {
+    let (fallback_view, fallback_sampler) = fallback;
+    let mut entries = Vec::with_capacity(1 + bound_textures.len() * 2);
+    entries.push(BindGroupEntry {
+        binding: 0,
+        resource: uniform_buffer.as_entire_binding(),
+    });
+    for (i, bound) in bound_textures.iter().enumerate() {
+        let (view, sampler) = match bound {
+            Some(b) => (&b.view, &b.sampler),
+            None => (fallback_view, fallback_sampler),
+        };
+        entries.push(BindGroupEntry {
+            binding: 1 + 2 * i as u32,
+            resource: BindingResource::TextureView(view),
+        });
+        entries.push(BindGroupEntry {
+            binding: 2 + 2 * i as u32,
+            resource: BindingResource::Sampler(sampler),
+        });
+    }
+    device.create_bind_group(&BindGroupDescriptor {
+        label: Some("vk2d.material.bind_group"),
+        layout,
+        entries: &entries,
+    })
+}
+
+/// Build the material's bind-group layout: the uniform block at binding 0,
+/// then for each of `texture_count` declared textures, a filterable
+/// `texture_2d<f32>` at `1+2i` and a filtering `sampler` at `2+2i` — the
+/// contract documented on `MaterialDesc::textures`.
+fn create_bind_group_layout(device: &Device, texture_count: usize) -> BindGroupLayout {
+    let mut entries = Vec::with_capacity(1 + texture_count * 2);
+    entries.push(BindGroupLayoutEntry {
+        binding: 0,
+        visibility: ShaderStages::VERTEX_FRAGMENT,
+        ty: BindingType::Buffer {
+            ty: BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    });
+    for i in 0..texture_count {
+        entries.push(BindGroupLayoutEntry {
+            binding: 1 + 2 * i as u32,
+            visibility: ShaderStages::FRAGMENT,
+            ty: BindingType::Texture {
+                sample_type: TextureSampleType::Float { filterable: true },
+                view_dimension: TextureViewDimension::D2,
+                multisampled: false,
             },
             count: None,
-        }],
+        });
+        entries.push(BindGroupLayoutEntry {
+            binding: 2 + 2 * i as u32,
+            visibility: ShaderStages::FRAGMENT,
+            ty: BindingType::Sampler(SamplerBindingType::Filtering),
+            count: None,
+        });
+    }
+    device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("vk2d.material.bind_group_layout"),
+        entries: &entries,
     })
+}
+
+/// Build a 1x1 opaque-white texture view + sampler, used as the fallback for
+/// any declared material texture slot that hasn't been bound yet (so an
+/// un-bound `textureSample` reads white rather than leaving the slot
+/// unpopulated). Created once, lazily, by `Context`.
+pub(crate) fn create_fallback_texture(device: &Device, queue: &Queue) -> (TextureView, Sampler) {
+    let size = Extent3d {
+        width: 1,
+        height: 1,
+        depth_or_array_layers: 1,
+    };
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("vk2d.material.fallback_texture"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8UnormSrgb,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: Default::default(),
+            aspect: TextureAspect::All,
+        },
+        &[255u8, 255, 255, 255],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: Some(1),
+        },
+        size,
+    );
+    let view = texture.create_view(&TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&SamplerDescriptor {
+        label: Some("vk2d.material.fallback_sampler"),
+        address_mode_u: AddressMode::ClampToEdge,
+        address_mode_v: AddressMode::ClampToEdge,
+        address_mode_w: AddressMode::ClampToEdge,
+        mag_filter: FilterMode::Nearest,
+        min_filter: FilterMode::Nearest,
+        ..Default::default()
+    });
+    (view, sampler)
 }
 
 /// Parse + validate WGSL and emit SPIR-V words. `Err(ShaderCompile)` on any

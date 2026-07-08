@@ -1,0 +1,33 @@
+[package]
+name = "vk2d"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Standalone immediate-mode 2D renderer on wgpu/Vulkan with WGSL shaders."
+repository = "https://github.com/soulwax/EchoWarrior"
+keywords = ["wgpu", "vulkan", "2d", "renderer", "wgsl"]
+categories = ["rendering", "game-development"]
+
+[dependencies]
+# `spirv` enables `ShaderSource::SpirV`, which the WGSL->SPIR-V startup path
+# feeds (naga compiles WGSL to SPIR-V, wgpu consumes the bytecode).
+wgpu = { version = "29", features = ["spirv"] }
+winit = "0.30"
+pollster = "0.4"
+naga = { version = "29", features = ["wgsl-in", "spv-out"] }
+fontdue = "0.9"
+
+# Optional integrations, off by default so the core crate's dependency surface
+# stays small.
+egui = { version = "0.35", optional = true }
+egui-wgpu = { version = "0.35", optional = true }
+egui-winit = { version = "0.35", optional = true, default-features = false, features = [
+    "links",
+    "wayland",
+    "x11",
+] }
+
+[features]
+default = []
+egui = ["dep:egui", "dep:egui-wgpu", "dep:egui-winit"]
+winit-input = []

@@ -70,6 +70,24 @@ struct GalleryEntry {
     wants_scene: bool,
 }
 
+/// Infer the texture slots a gallery shader declares, in binding order. This
+/// mirrors the current WGSL parity set's names and keeps the gallery honest:
+/// a shader declaring `@binding(1)` must be loaded with a matching
+/// `MaterialDesc::textures` entry or wgpu rejects the pipeline layout.
+fn declared_texture_slots(source: &str) -> Vec<&'static str> {
+    let mut slots = Vec::new();
+    if source.contains("var scene: texture_2d") {
+        slots.push("scene");
+    }
+    if source.contains("var tex: texture_2d") {
+        slots.push("tex");
+    }
+    if source.contains("var u_noise_tex: texture_2d") {
+        slots.push("u_noise_tex");
+    }
+    slots
+}
+
 /// Resolve the repo root from `CARGO_MANIFEST_DIR` (this example lives in
 /// `crates/vk2d`, so the repo root is two levels up).
 fn repo_root() -> PathBuf {
@@ -158,19 +176,19 @@ fn load_gallery(ctx: &mut Context, wgsl_root: &Path, arcane: &str) -> Vec<Galler
                 continue;
             }
         };
-        let wants_scene = source.contains("\"scene\"") || source.contains("scene_texture");
+        let texture_slots = declared_texture_slots(&source);
+        let wants_scene = texture_slots.contains(&"scene");
         let prelude = if arcane.is_empty() {
             None
         } else {
             Some(arcane)
         };
-        let textures: &[&str] = if wants_scene { &["scene"] } else { &[] };
         let desc = MaterialDesc {
             wgsl: &source,
             blend: vk2d::BlendMode::Additive,
             uniforms: UNIFORM_SUPERSET,
             prelude,
-            textures,
+            textures: &texture_slots,
         };
         match ctx.load_material(desc) {
             Ok(mat) => entries.push(GalleryEntry {

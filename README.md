@@ -74,6 +74,8 @@ let mat = ctx.load_material(MaterialDesc {
     wgsl: mat_wgsl,                      // must define vs_main + fs_main and a
     blend: BlendMode::Additive,         // uniform block at @group(0) @binding(0)
     uniforms: &[("time", UniformType::Vec4)],
+    prelude: None,
+    textures: &[],
 })?;
 # let mut frame = ctx.begin_frame(vk2d::Color::BLACK)?;
 frame.set_uniform(mat, "time", UniformValue::Vec4(1.5, 0.0, 0.0, 0.0));
@@ -90,6 +92,37 @@ runnable window with a sprite, vector primitives, and a time-driven material.
 cargo run -p vk2d --example hello_sprite
 cargo run -p vk2d --example hello_sprite -- --frames 3   # smoke run, exits 0
 ```
+
+For shader-library parity work, [`examples/shader_gallery.rs`](examples/shader_gallery.rs)
+walks a parent repo's `Assets/Shaders/wgsl/` tree, prepends
+`lib/arcane.wgsl`, loads every material it can, and lets you cycle through the
+resulting effects:
+
+```console
+cargo run -p vk2d --example shader_gallery
+cargo run -p vk2d --example shader_gallery -- --frames 3
+```
+
+Texture-sampling materials declare their texture slots in `MaterialDesc`:
+
+```rust,no_run
+# use vk2d::{BlendMode, Context, MaterialDesc, UniformType};
+# fn go(ctx: &mut Context, wgsl: &str, prelude: &str) -> Result<(), vk2d::Vk2dError> {
+let mat = ctx.load_material(MaterialDesc {
+    wgsl,
+    blend: BlendMode::Additive,
+    uniforms: &[("u_time", UniformType::Vec4)],
+    prelude: Some(prelude),
+    textures: &["scene"],
+})?;
+# let _ = mat;
+# Ok(())
+# }
+```
+
+The first texture name maps to WGSL `@binding(1)` plus sampler `@binding(2)`;
+the second maps to `@binding(3)` plus sampler `@binding(4)`, and so on. Unbound
+slots sample a 1x1 white fallback until the frame binds a texture or target.
 
 ## Features
 

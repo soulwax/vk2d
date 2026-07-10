@@ -4,10 +4,13 @@
 //! holds shared prelude source, not standalone materials), loads every
 //! `*.wgsl` file found as a material with the shared `arcane.wgsl` prelude
 //! (if present) and a permissive uniform superset, then renders the selected
-//! one fullscreen each frame, driven by elapsed time. Cycle with Left/Right
-//! arrows. A shader whose WGSL fails to compile still shows up in the list —
-//! selecting it draws a magenta error tile instead of crashing, so a bad port
-//! is visible without taking down the whole gallery.
+//! one fullscreen each frame, driven by elapsed time.
+//!
+//! **Controls:** Left/Right arrows cycle the selected shader, Esc quits. Keys
+//! are read straight from the winit event, so cycling works on a plain
+//! `cargo run` with no feature flags. A shader whose WGSL fails to compile
+//! still shows up in the list — selecting it draws a magenta error tile instead
+//! of crashing, so a bad port is visible without taking down the whole gallery.
 //!
 //! This example intentionally tolerates an incomplete shader tree: at the
 //! time this gallery was written only `Assets/Shaders/wgsl/healing_ray.wgsl`
@@ -23,8 +26,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-#[cfg(feature = "winit-input")]
-use vk2d::InputState;
 use vk2d::{
     Backend, Color, Context, ContextConfig, FontId, MaterialDesc, MaterialId, Point, Rect2,
     TargetId, TextStyle, UniformType, UniformValue, Vk2dError,
@@ -319,8 +320,6 @@ fn main() {
         frames: 0,
         max_frames,
         close: false,
-        #[cfg(feature = "winit-input")]
-        input: InputState::new(),
     };
     event_loop.run_app(&mut app).expect("run");
 }
@@ -341,8 +340,6 @@ struct App {
     frames: u32,
     max_frames: Option<u32>,
     close: bool,
-    #[cfg(feature = "winit-input")]
-    input: InputState,
 }
 
 impl App {
@@ -368,7 +365,7 @@ impl App {
         frame.finish();
     }
 
-    #[cfg(feature = "winit-input")]
+    /// Move the selection by `delta` (wrapping), skipping if the list is empty.
     fn select_delta(&mut self, delta: i32) {
         if self.entries.is_empty() {
             return;
@@ -466,9 +463,6 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        #[cfg(feature = "winit-input")]
-        self.input.feed(&event);
-
         match event {
             WindowEvent::CloseRequested => self.close = true,
             WindowEvent::Resized(size) => {
@@ -476,23 +470,29 @@ impl ApplicationHandler for App {
                     ctx.resize(size.width, size.height);
                 }
             }
-            WindowEvent::RedrawRequested => {
-                #[cfg(feature = "winit-input")]
-                {
-                    if self
-                        .input
-                        .is_named_pressed(winit::keyboard::NamedKey::ArrowRight)
-                    {
-                        self.select_delta(1);
-                    }
-                    if self
-                        .input
-                        .is_named_pressed(winit::keyboard::NamedKey::ArrowLeft)
-                    {
-                        self.select_delta(-1);
-                    }
+            // Cycle the selected shader with Left/Right arrows. Read straight
+            // from the winit key event (on key-DOWN only) rather than through
+            // vk2d's optional `winit-input` feature, so the gallery cycles on a
+            // plain `cargo run --example shader_gallery` with no extra flags.
+            WindowEvent::KeyboardInput {
+                event:
+                    winit::event::KeyEvent {
+                        logical_key,
+                        state: winit::event::ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                use winit::keyboard::{Key, NamedKey};
+                match logical_key {
+                    Key::Named(NamedKey::ArrowRight) => self.select_delta(1),
+                    Key::Named(NamedKey::ArrowLeft) => self.select_delta(-1),
+                    Key::Named(NamedKey::Escape) => self.close = true,
+                    _ => {}
                 }
-
+            }
+            WindowEvent::RedrawRequested => {
                 let t = self.start.elapsed().as_secs_f32();
                 let current_wants_scene = self
                     .entries
@@ -621,9 +621,6 @@ impl ApplicationHandler for App {
                         self.close = true;
                     }
                 }
-
-                #[cfg(feature = "winit-input")]
-                self.input.end_frame();
             }
             _ => {}
         }

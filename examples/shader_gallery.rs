@@ -48,32 +48,43 @@ const LOGICAL: (u32, u32) = (1600, 900);
 /// declared uniform, so the gallery MUST declare exactly the fields the shader's
 /// struct contains — a shader with 7 or 37 uniforms bound with only 6 slots
 /// makes wgpu reject the draw ("buffer bound with size N where the shader
-/// expects M"). Every field is a `vec4<f32>` by the port convention; we read the
-/// name before the `:` on each line inside the block. Returns an empty vec if no
-/// `struct Uniforms` is found (a shader with no uniform block).
+/// expects M"). Every field is a `vec4<f32>` by the port convention.
+///
+/// Handles both the multi-line struct form (one `name: type,` per line) and the
+/// single-line form (`struct Uniforms { u_direction: vec4<f32>, u_texel:
+/// vec4<f32> };`, used by bloom_blur): the whole `{ … }` block is extracted
+/// first, `//` comments are stripped, then each comma-separated field's name
+/// (the token before its `:`) is collected. Returns an empty vec if no
+/// `struct Uniforms` block is found.
 fn parse_uniform_fields(source: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut in_block = false;
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if !in_block {
-            if trimmed.starts_with("struct Uniforms") {
-                in_block = true;
-            }
-            continue;
-        }
-        if trimmed.starts_with('}') {
-            break;
-        }
-        // A field line looks like `u_time: vec4<f32>,` (optionally // comment).
-        if let Some((name, _rest)) = trimmed.split_once(':') {
-            let name = name.trim();
-            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                names.push(name.to_string());
-            }
-        }
-    }
-    names
+    // Isolate the text between the first `struct Uniforms` and its closing `}`.
+    let Some(after_kw) = source.find("struct Uniforms") else {
+        return Vec::new();
+    };
+    let rest = &source[after_kw..];
+    let Some(open) = rest.find('{') else {
+        return Vec::new();
+    };
+    let Some(close_rel) = rest[open..].find('}') else {
+        return Vec::new();
+    };
+    let body = &rest[open + 1..open + close_rel];
+
+    // Drop `//` line comments so a trailing `// .rgb` note can't leak into a
+    // field name, then split fields on commas (works for one-per-line and
+    // single-line struct bodies alike).
+    let cleaned: String = body
+        .lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    cleaned
+        .split(',')
+        .filter_map(|field| field.split_once(':'))
+        .map(|(name, _ty)| name.trim().to_string())
+        .filter(|name| !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_'))
+        .collect()
 }
 
 /// A gallery entry: one `.wgsl` file found under the shader tree, its tier

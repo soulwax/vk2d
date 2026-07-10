@@ -65,12 +65,19 @@ pub struct Frame<'ctx> {
 }
 
 impl Context {
-    /// Ensure the default scene target exists (sized to the logical size), and
-    /// return its `TargetId` index.
-    fn ensure_scene(&mut self) -> usize {
+    /// Ensure the default scene target (`targets[0]`) exists, sized to the
+    /// logical size, and return its index (always 0).
+    ///
+    /// This reserves index 0 for the scene the swapchain path renders into and
+    /// blits. It is called both at the start of a frame AND by the public
+    /// [`Context::create_target`], so an app that creates its own target BEFORE
+    /// its first frame cannot accidentally claim index 0 and end up rendering
+    /// the frame into the very target it also samples (which wgpu rejects as a
+    /// COLOR_TARGET/RESOURCE usage conflict).
+    pub(crate) fn ensure_scene(&mut self) -> usize {
         if self.targets.is_empty() {
             let (w, h) = self.logical_size;
-            self.create_target(w, h);
+            self.push_target(w, h);
         }
         0
     }

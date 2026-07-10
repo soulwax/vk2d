@@ -568,6 +568,22 @@ impl ApplicationHandler for App {
                                 // orb wants a visible intensity + tint.
                                 frame.set_uniform(mat, "u_intensity", vec4(1.0, 0.0, 0.0, 0.0));
                                 frame.set_uniform(mat, "u_tint", vec4(0.5, 0.85, 1.0, 1.0));
+                                // dart's beam is STRUCTURAL: u_width/u_head_size
+                                // gate its thickness/head, so leaving them at 0
+                                // (as `half_w = max(u_width, 1e-4)`) collapses the
+                                // beam to invisibility. In-game these come from
+                                // attack_tiers.toml in world px; the gallery works
+                                // in UV [0,1], so feed UV-scale defaults roughly
+                                // matching a mid tier (thin bright beam, comet
+                                // head, some arcs). Harmless no-ops on shaders
+                                // that don't declare them.
+                                frame.set_uniform(mat, "u_width", vec4(0.012, 0.0, 0.0, 0.0));
+                                frame.set_uniform(mat, "u_head_size", vec4(1.0, 0.0, 0.0, 0.0));
+                                frame.set_uniform(mat, "u_trail", vec4(0.3, 0.0, 0.0, 0.0));
+                                frame.set_uniform(mat, "u_arc_count", vec4(1.0, 0.0, 0.0, 0.0));
+                                frame.set_uniform(mat, "u_arc_intensity", vec4(0.6, 0.0, 0.0, 0.0));
+                                frame.set_uniform(mat, "u_impact", vec4(0.4, 0.0, 0.0, 0.0));
+                                frame.set_uniform(mat, "u_pulse", vec4(0.4, 0.0, 0.0, 0.0));
 
                                 if entry.wants_scene
                                     && let Some(target) = self.demo_target

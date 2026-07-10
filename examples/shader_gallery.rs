@@ -37,18 +37,44 @@ use winit::window::{Window, WindowId};
 
 const LOGICAL: (u32, u32) = (1600, 900);
 
-/// The uniform superset every gallery material is loaded with. Real shaders
-/// only reference the subset they declare in their own `Uniforms` struct —
-/// vk2d ignores unknown names when a value is pushed for one, so offering the
-/// same permissive list to every material is harmless.
-const UNIFORM_SUPERSET: &[(&str, UniformType)] = &[
-    ("u_time", UniformType::Vec4),
-    ("u_color", UniformType::Vec4),
-    ("u_progress", UniformType::Vec4),
-    ("u_seed", UniformType::Vec4),
-    ("u_from", UniformType::Vec4),
-    ("u_to", UniformType::Vec4),
-];
+/// The gallery actively drives only a handful of uniforms each frame (time,
+/// progress, colour, a fixed from/to endpoint) in the render loop below. Any
+/// *other* field a shader declares is still allocated a slot (see
+/// `parse_uniform_fields`) so the buffer is correctly sized, but is left at
+/// zero — the gallery only knows how to animate that handful.
+///
+/// Parse the field names of a shader's `struct Uniforms` block, in declaration
+/// order. vk2d sizes a material's uniform buffer to one 16-byte slot per
+/// declared uniform, so the gallery MUST declare exactly the fields the shader's
+/// struct contains — a shader with 7 or 37 uniforms bound with only 6 slots
+/// makes wgpu reject the draw ("buffer bound with size N where the shader
+/// expects M"). Every field is a `vec4<f32>` by the port convention; we read the
+/// name before the `:` on each line inside the block. Returns an empty vec if no
+/// `struct Uniforms` is found (a shader with no uniform block).
+fn parse_uniform_fields(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_block = false;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if !in_block {
+            if trimmed.starts_with("struct Uniforms") {
+                in_block = true;
+            }
+            continue;
+        }
+        if trimmed.starts_with('}') {
+            break;
+        }
+        // A field line looks like `u_time: vec4<f32>,` (optionally // comment).
+        if let Some((name, _rest)) = trimmed.split_once(':') {
+            let name = name.trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
 
 /// A gallery entry: one `.wgsl` file found under the shader tree, its tier
 /// (the top-level subfolder name, or `"root"` if it has none), and either a
@@ -183,10 +209,18 @@ fn load_gallery(ctx: &mut Context, wgsl_root: &Path, arcane: &str) -> Vec<Galler
         } else {
             Some(arcane)
         };
+        // Declare exactly the uniforms THIS shader's struct contains, so vk2d
+        // sizes the buffer correctly (a 7- or 37-uniform shader bound with a
+        // fixed 6-slot buffer makes wgpu reject the draw).
+        let field_names = parse_uniform_fields(&source);
+        let uniforms: Vec<(&str, UniformType)> = field_names
+            .iter()
+            .map(|n| (n.as_str(), UniformType::Vec4))
+            .collect();
         let desc = MaterialDesc {
             wgsl: &source,
             blend: vk2d::BlendMode::Additive,
-            uniforms: UNIFORM_SUPERSET,
+            uniforms: &uniforms,
             prelude,
             textures: &texture_slots,
         };
@@ -221,11 +255,19 @@ fn load_gallery(ctx: &mut Context, wgsl_root: &Path, arcane: &str) -> Vec<Galler
 /// asset the rest of the project already ships; if none of these paths exist
 /// (a stripped-down checkout of just the `vk2d` crate), the gallery falls
 /// back to printing shader names to stdout instead of drawing text.
+///
+/// Fonts are tried in order of glyph coverage, not preference: the label
+/// contains digits and punctuation (`[`, `]`, `/`), and a decorative arcade
+/// face like `ARCADECLASSIC` lacks those glyphs — it renders them as tofu
+/// boxes. A general-purpose face (Friz Quadrata, Golden Sun) covers the full
+/// label, so those come first and the arcade face is a last resort.
 fn find_label_font(repo: &Path) -> Option<PathBuf> {
     const CANDIDATES: &[&str] = &[
-        "Assets/Fonts/arcadeclassic/ARCADECLASSIC.TTF",
+        "Assets/Fonts/friz-quadrata/friz-quadrata-regular.ttf",
+        "Assets/Fonts/GS/Golden-Sun.ttf",
         "Assets/Fonts/compass-gold-v1/CompassGold.ttf",
         "Assets/Fonts/ruler-gold-v1/RulerGold.ttf",
+        "Assets/Fonts/arcadeclassic/ARCADECLASSIC.TTF",
     ];
     CANDIDATES
         .iter()
@@ -233,23 +275,32 @@ fn find_label_font(repo: &Path) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-fn main() {
-    let max_frames = std::env::args()
+/// Parse a `--flag value` or `--flag=value` string argument.
+fn arg_value(flag: &str) -> Option<String> {
+    let eq = format!("{flag}=");
+    std::env::args()
         .skip(1)
-        .filter_map(|a| a.strip_prefix("--frames=").map(str::to_owned))
+        .filter_map(|a| a.strip_prefix(&eq).map(str::to_owned))
         .next()
         .or_else(|| {
-            let mut it = std::env::args().skip_while(|a| a != "--frames");
+            let mut it = std::env::args().skip_while(|a| a != flag);
             it.next();
             it.next()
         })
-        .and_then(|v| v.parse::<u32>().ok());
+}
+
+fn main() {
+    let max_frames = arg_value("--frames").and_then(|v| v.parse::<u32>().ok());
+    // `--shader <name>` opens directly on a named shader (file stem), handy for
+    // scripted parity capture of one effect (e.g. the 37-uniform ambient_tint).
+    let initial_shader = arg_value("--shader");
 
     let event_loop = EventLoop::new().expect("event loop");
     let mut app = App {
         window: None,
         ctx: None,
         entries: Vec::new(),
+        initial_shader,
         selected: 0,
         font: None,
         demo_target: None,
@@ -267,6 +318,8 @@ struct App {
     window: Option<Arc<Window>>,
     ctx: Option<Context>,
     entries: Vec<GalleryEntry>,
+    /// `--shader <name>` file stem to open on, if given.
+    initial_shader: Option<String>,
     selected: usize,
     font: Option<FontId>,
     /// A small offscreen target holding a demo scene, bound as the `scene`
@@ -340,6 +393,26 @@ impl ApplicationHandler for App {
         let wgsl_root = repo.join("Assets").join("Shaders").join("wgsl");
         let arcane = read_arcane_prelude(&wgsl_root);
         self.entries = load_gallery(&mut ctx, &wgsl_root, &arcane);
+
+        // Pick the initial selection: an explicit `--shader <name>` wins;
+        // otherwise open on the first continuously-visible effect rather than
+        // whatever sorts first alphabetically. `ability/healing_ray` (the
+        // alphabetical first) is a *pulsed cast* animation gated on
+        // `u_progress`, so at a random instant it is mostly invisible — a poor
+        // first impression that reads as "the gallery is blank". The `effects/`
+        // tier holds steady procedural effects (spark, ward, …) that are lit at
+        // any time, so default to the first one that loaded.
+        self.selected = self
+            .initial_shader
+            .as_deref()
+            .and_then(|name| self.entries.iter().position(|e| e.name == name))
+            .or_else(|| {
+                self.entries
+                    .iter()
+                    .position(|e| e.tier == "effects" && e.material.is_some())
+            })
+            .or_else(|| self.entries.iter().position(|e| e.material.is_some()))
+            .unwrap_or(0);
 
         if self.entries.is_empty() {
             println!(
@@ -456,10 +529,20 @@ impl ApplicationHandler for App {
                                     "u_color",
                                     UniformValue::Vec4(1.0, 1.0, 1.0, 1.0),
                                 );
+                                // Drive progress as a slow triangle wave that
+                                // dwells in the visible mid-band (~0.15–0.85)
+                                // instead of a sawtooth that snaps through the
+                                // invisible 0.0/1.0 edges. Pulsed cast effects
+                                // (healing_ray, ward, lance, …) gate visibility
+                                // on `smoothstep(0, 0.14, u_progress)` and a
+                                // matching release near 1.0; a triangle keeps
+                                // them lit for eyeballing rather than flashing.
+                                let tri = 1.0 - (2.0 * (t * 0.18).fract() - 1.0).abs();
+                                let progress = 0.12 + 0.76 * tri;
                                 frame.set_uniform(
                                     mat,
                                     "u_progress",
-                                    UniformValue::Vec4((t * 0.3).fract(), 0.0, 0.0, 0.0),
+                                    UniformValue::Vec4(progress, 0.0, 0.0, 0.0),
                                 );
                                 frame.set_uniform(
                                     mat,

@@ -229,7 +229,16 @@ impl ShapeBatch {
             self.grow(device, vert_count);
         }
         let vbytes: Vec<u8> = self.verts.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let ibytes: Vec<u8> = self.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let mut ibytes: Vec<u8> = self.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        // `write_buffer` requires the source length to be a multiple of
+        // COPY_BUFFER_ALIGNMENT (4). u16 indices are 2 bytes each, so an ODD
+        // index count yields a 2-mod-4 length and wgpu rejects the copy. Pad to
+        // the next multiple of 4 (the extra bytes sit past `indices.len()`, so
+        // draw_indexed never reads them). The index buffer is allocated with the
+        // same rounding, so the padded write stays in bounds.
+        while !ibytes.len().is_multiple_of(4) {
+            ibytes.push(0);
+        }
         queue.write_buffer(&self.vertex_buffer, 0, &vbytes);
         queue.write_buffer(&self.index_buffer, 0, &ibytes);
     }

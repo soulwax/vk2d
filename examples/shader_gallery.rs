@@ -43,6 +43,31 @@ fn vec4(x: f32, y: f32, z: f32, w: f32) -> UniformValue {
     UniformValue::Vec4(x, y, z, w)
 }
 
+/// A one-line explanation drawn under a shader's label, for effects whose role
+/// isn't obvious in isolation — chiefly the bloom chain, which is three stages
+/// of one pipeline (each shown separately here) rather than three effects. The
+/// demo scene has bright hotspots specifically so these read. Returns `None`
+/// for self-explanatory effects.
+fn shader_hint(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "bloom_prefilter" => {
+            "bloom 1/3: keeps only pixels brighter than a threshold (the hotspots) — the rest goes black"
+        }
+        "bloom_blur" => {
+            "bloom 2/3: separable Gaussian blur; run once horizontal then once vertical to spread the brights"
+        }
+        "bloom_composite" => {
+            "bloom 3/3: the blurred brights, tinted, added back over the scene as glow (additive)"
+        }
+        "ambient_tint" => {
+            "post-process: shifts the whole scene's brightness / colour tint / fog — subtle by design"
+        }
+        "orb" => "pickup orb, authored for a small square quad (reads oval stretched fullscreen)",
+        "transition" => "screen wipe / dissolve; drive u_progress to sweep it",
+        _ => return None,
+    })
+}
+
 /// The gallery actively drives only a handful of uniforms each frame (time,
 /// progress, colour, a fixed from/to endpoint) in the render loop below. Any
 /// *other* field a shader declares is still allocated a slot (see
@@ -348,25 +373,83 @@ struct App {
 }
 
 impl App {
-    /// Render the small demo scene into `demo_target` (a couple of filled
-    /// rects), used as the `scene` input for post-process-style materials.
+    /// Render the demo scene into `demo_target`, used as the `scene` input for
+    /// post-process materials. Built to make each post effect legible:
+    /// - a dark→mid gradient of horizontal bands so `ambient_tint`'s tint / fog
+    ///   / brightness shift is visible against a range of tones;
+    /// - several near-white **hotspots** (bright discs + a bright bar) so the
+    ///   bloom chain has bright pixels to isolate and glow — `bloom_prefilter`
+    ///   keeps only these, `bloom_blur` spreads them, `bloom_composite` adds the
+    ///   glow back;
+    /// - mid-tone coloured shapes to show the scene is more than the hotspots.
+    ///
     /// Only invoked when the selected entry actually declares a scene slot.
-    fn render_demo_scene(&mut self, target: TargetId) {
+    fn render_demo_scene(&mut self, target: TargetId, t: f32) {
         let Some(ctx) = self.ctx.as_mut() else {
             return;
         };
-        let Ok(mut frame) = ctx.begin_target_frame(target, Color::rgb(0.08, 0.08, 0.12)) else {
+        let Ok(mut frame) = ctx.begin_target_frame(target, Color::rgb(0.04, 0.05, 0.09)) else {
             return;
         };
+        let (w, h) = (LOGICAL.0 as f32, LOGICAL.1 as f32);
+
+        // Dark→mid horizontal band gradient — a tonal range for ambient_tint to
+        // act on (its tint/fog/brightness change reads clearly across bands).
+        let bands = 6;
+        for i in 0..bands {
+            let f = i as f32 / (bands - 1) as f32;
+            let y = h * i as f32 / bands as f32;
+            frame.fill_rect(
+                Rect2::new(0.0, y, w, h / bands as f32 + 1.0),
+                Color::rgb(0.05 + 0.14 * f, 0.06 + 0.12 * f, 0.11 + 0.10 * f),
+            );
+        }
+
+        // Mid-tone coloured shapes (NOT bright enough to bloom) — proof the
+        // scene has content beyond the hotspots; ambient_tint tints these.
         frame.fill_rect(
-            Rect2::new(60.0, 60.0, 220.0, 160.0),
-            Color::rgb(0.8, 0.3, 0.3),
+            Rect2::new(120.0, 160.0, 300.0, 220.0),
+            Color::rgb(0.32, 0.20, 0.42),
         );
         frame.fill_rect(
-            Rect2::new(340.0, 220.0, 180.0, 180.0),
-            Color::rgb(0.3, 0.6, 0.9),
+            Rect2::new(w - 460.0, 520.0, 320.0, 200.0),
+            Color::rgb(0.18, 0.34, 0.30),
         );
-        frame.circle(Point::new(480.0, 90.0), 60.0, Color::rgb(0.9, 0.8, 0.3));
+        frame.triangle(
+            Point::new(w * 0.5, 140.0),
+            Point::new(w * 0.5 - 150.0, 400.0),
+            Point::new(w * 0.5 + 150.0, 400.0),
+            Color::rgb(0.30, 0.28, 0.16),
+        );
+
+        // Bright near-white HOTSPOTS — the only pixels above a bloom threshold.
+        // A slow drift so the glow is clearly moving when a bloom stage is on.
+        let drift = (t * 0.5).sin() * 80.0;
+        frame.circle(
+            Point::new(w * 0.30 + drift, h * 0.42),
+            46.0,
+            Color::rgb(1.0, 0.96, 0.85),
+        );
+        frame.circle(
+            Point::new(w * 0.68 - drift, h * 0.60),
+            58.0,
+            Color::rgb(0.85, 0.95, 1.0),
+        );
+        frame.circle(
+            Point::new(w * 0.80, h * 0.28),
+            30.0,
+            Color::rgb(1.0, 1.0, 1.0),
+        );
+        // A bright horizontal bar (a strong edge for the separable blur to smear).
+        frame.fill_rect(
+            Rect2::new(w * 0.20, h * 0.78, w * 0.60, 10.0),
+            Color::rgb(0.95, 0.98, 1.0),
+        );
+        // A cluster of small bright dots (fine detail bloom picks up).
+        for i in 0..5 {
+            let x = w * 0.42 + i as f32 * 44.0;
+            frame.circle(Point::new(x, h * 0.20), 8.0, Color::rgb(1.0, 0.9, 0.7));
+        }
         frame.finish();
     }
 
@@ -509,9 +592,11 @@ impl ApplicationHandler for App {
                         self.ctx
                             .as_mut()
                             .expect("context initialized before first redraw")
-                            .create_target(600, 400)
+                            // Full logical size so the post shaders sample the
+                            // demo scene 1:1 instead of stretching a small target.
+                            .create_target(LOGICAL.0, LOGICAL.1)
                     });
-                    self.render_demo_scene(target);
+                    self.render_demo_scene(target, t);
                 }
 
                 if let Some(ctx) = self.ctx.as_mut() {
@@ -584,6 +669,30 @@ impl ApplicationHandler for App {
                                 frame.set_uniform(mat, "u_arc_intensity", vec4(0.6, 0.0, 0.0, 0.0));
                                 frame.set_uniform(mat, "u_impact", vec4(0.4, 0.0, 0.0, 0.0));
                                 frame.set_uniform(mat, "u_pulse", vec4(0.4, 0.0, 0.0, 0.0));
+                                // ambient_tint's atmosphere grade: without these
+                                // it multiplies the scene by `brightness * tint`,
+                                // both 0 by default → black. Feed a lit daytime
+                                // grade with a faint warm tint + light fog so the
+                                // demo scene shows and the grade reads. Slowly
+                                // sweep brightness so the tint shift is visible.
+                                let breathe = 0.75 + 0.25 * (t * 0.6).sin();
+                                frame.set_uniform(
+                                    mat,
+                                    "u_ambient_brightness",
+                                    vec4(breathe, 0.0, 0.0, 0.0),
+                                );
+                                frame.set_uniform(
+                                    mat,
+                                    "u_ambient_tint",
+                                    vec4(1.05, 0.98, 0.90, 0.0),
+                                );
+                                frame.set_uniform(mat, "u_fog_tint", vec4(0.55, 0.62, 0.78, 0.0));
+                                frame.set_uniform(mat, "u_fog_density", vec4(0.18, 0.0, 0.0, 0.0));
+                                // bloom_prefilter's brightness threshold — at 0
+                                // (the default) nothing is filtered and it passes
+                                // the whole scene. ~0.7 keeps only the near-white
+                                // hotspots so its "keep the brights" role reads.
+                                frame.set_uniform(mat, "u_threshold", vec4(0.7, 0.0, 0.0, 0.0));
 
                                 if entry.wants_scene
                                     && let Some(target) = self.demo_target
@@ -626,6 +735,19 @@ impl ApplicationHandler for App {
                                     color: Color::rgb(1.0, 1.0, 1.0),
                                 },
                             );
+                            // A one-line role hint for effects that aren't
+                            // obvious in isolation (the bloom stages, ambient_tint).
+                            if let Some(hint) = shader_hint(&entry.name) {
+                                frame.text(
+                                    font,
+                                    hint,
+                                    Point::new(24.0, 52.0),
+                                    TextStyle {
+                                        size: 15.0,
+                                        color: Color::rgb(0.68, 0.74, 0.82),
+                                    },
+                                );
+                            }
                         }
                     }
 

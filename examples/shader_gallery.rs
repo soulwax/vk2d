@@ -38,6 +38,11 @@ use winit::window::{Window, WindowId};
 
 const LOGICAL: (u32, u32) = (1600, 900);
 
+/// Shorthand for a `vec4` uniform value (the gallery pushes many per frame).
+fn vec4(x: f32, y: f32, z: f32, w: f32) -> UniformValue {
+    UniformValue::Vec4(x, y, z, w)
+}
+
 /// The gallery actively drives only a handful of uniforms each frame (time,
 /// progress, colour, a fixed from/to endpoint) in the render loop below. Any
 /// *other* field a shader declares is still allocated a slot (see
@@ -530,46 +535,40 @@ impl ApplicationHandler for App {
                     } else if let Some(entry) = self.entries.get(self.selected) {
                         match entry.material {
                             Some(mat) => {
-                                frame.set_uniform(
-                                    mat,
-                                    "u_time",
-                                    UniformValue::Vec4(t, 0.0, 0.0, 0.0),
-                                );
-                                frame.set_uniform(
-                                    mat,
-                                    "u_color",
-                                    UniformValue::Vec4(1.0, 1.0, 1.0, 1.0),
-                                );
-                                // Drive progress as a slow triangle wave that
-                                // dwells in the visible mid-band (~0.15–0.85)
-                                // instead of a sawtooth that snaps through the
-                                // invisible 0.0/1.0 edges. Pulsed cast effects
-                                // (healing_ray, ward, lance, …) gate visibility
-                                // on `smoothstep(0, 0.14, u_progress)` and a
-                                // matching release near 1.0; a triangle keeps
-                                // them lit for eyeballing rather than flashing.
+                                // Aspect of the fullscreen viewport. Aspect-aware
+                                // shaders (kaleidoscope, warp, blur, prism,
+                                // ambient_tint via `u_screen_size`; vfx_pulse via
+                                // `time_aspect.y`) un-stretch their circular
+                                // geometry with this — without it they collapse
+                                // horizontally. Shaders authored for square world
+                                // quads (spark, ward, …) carry no aspect uniform
+                                // and will read as ovals on a 16:9 fullscreen,
+                                // which is expected for a fullscreen preview.
+                                let (vw, vh) = LOGICAL;
+                                let aspect = vw as f32 / vh as f32;
                                 let tri = 1.0 - (2.0 * (t * 0.18).fract() - 1.0).abs();
                                 let progress = 0.12 + 0.76 * tri;
+
+                                // Standard VFX uniform contract (the effects/
+                                // and healing_ray family).
+                                frame.set_uniform(mat, "u_time", vec4(t, 0.0, 0.0, 0.0));
+                                frame.set_uniform(mat, "u_color", vec4(0.35, 0.85, 1.0, 1.0));
+                                frame.set_uniform(mat, "u_progress", vec4(progress, 0.0, 0.0, 0.0));
+                                frame.set_uniform(mat, "u_seed", vec4(0.37, 0.0, 0.0, 0.0));
+                                frame.set_uniform(mat, "u_from", vec4(0.28, 0.5, 0.0, 0.0));
+                                frame.set_uniform(mat, "u_to", vec4(0.72, 0.5, 0.0, 0.0));
+                                // Aspect-aware effects read the viewport size.
                                 frame.set_uniform(
                                     mat,
-                                    "u_progress",
-                                    UniformValue::Vec4(progress, 0.0, 0.0, 0.0),
+                                    "u_screen_size",
+                                    vec4(vw as f32, vh as f32, 0.0, 0.0),
                                 );
-                                frame.set_uniform(
-                                    mat,
-                                    "u_seed",
-                                    UniformValue::Vec4(0.0, 0.0, 0.0, 0.0),
-                                );
-                                frame.set_uniform(
-                                    mat,
-                                    "u_from",
-                                    UniformValue::Vec4(0.2, 0.5, 0.0, 0.0),
-                                );
-                                frame.set_uniform(
-                                    mat,
-                                    "u_to",
-                                    UniformValue::Vec4(0.8, 0.5, 0.0, 0.0),
-                                );
+                                // vfx_pulse packs (time, aspect) into one uniform.
+                                frame.set_uniform(mat, "time_aspect", vec4(t, aspect, 0.0, 0.0));
+                                // orb wants a visible intensity + tint.
+                                frame.set_uniform(mat, "u_intensity", vec4(1.0, 0.0, 0.0, 0.0));
+                                frame.set_uniform(mat, "u_tint", vec4(0.5, 0.85, 1.0, 1.0));
+
                                 if entry.wants_scene
                                     && let Some(target) = self.demo_target
                                 {

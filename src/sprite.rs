@@ -73,6 +73,14 @@ pub(crate) struct SpriteInstance {
     pub tint: [f32; 4],
 }
 
+/// One submission-ordered batch of instances sharing source pixel dimensions.
+/// Keeping the dimensions with the run lets staging consume the
+/// frame's runs directly, without building an intermediate reference vector.
+pub(crate) struct SpriteDrawRun {
+    pub atlas_size: (f32, f32),
+    pub instances: Vec<SpriteInstance>,
+}
+
 const SHADER: &str = r#"
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -123,6 +131,11 @@ pub(crate) struct SpriteBatch {
     index_buffer: Buffer,
     /// Capacity in sprites; buffers grow when a frame needs more.
     capacity: usize,
+    /// Reused CPU upload and draw-range scratch. These retain the largest
+    /// frame's capacity instead of allocating three fresh vectors per frame.
+    vertex_bytes: Vec<u8>,
+    index_bytes: Vec<u8>,
+    staged_runs: Vec<SpriteRun>,
 }
 
 /// A contiguous slice of the uploaded index buffer belonging to one texture,
@@ -156,6 +169,9 @@ impl SpriteBatch {
             vertex_buffer,
             index_buffer,
             capacity,
+            vertex_bytes: Vec::with_capacity(capacity * VERTS_PER_SPRITE * 32),
+            index_bytes: Vec::with_capacity(capacity * INDICES_PER_SPRITE * 2),
+            staged_runs: Vec::new(),
         }
     }
 
@@ -167,39 +183,50 @@ impl SpriteBatch {
         &mut self,
         device: &Device,
         queue: &Queue,
-        runs: &[(&[SpriteInstance], (f32, f32))],
+        runs: &[SpriteDrawRun],
         logical_size: (u32, u32),
-    ) -> Vec<SpriteRun> {
-        let total: usize = runs.iter().map(|(s, _)| s.len()).sum();
+    ) {
+        let total: usize = runs.iter().map(|run| run.instances.len()).sum();
+        self.vertex_bytes.clear();
+        self.index_bytes.clear();
+        self.staged_runs.clear();
         if total == 0 {
-            return Vec::new();
+            return;
         }
         if total > self.capacity {
             self.grow(device, total);
         }
-        let mut vertices: Vec<u8> = Vec::with_capacity(total * VERTS_PER_SPRITE * 32);
-        let mut indices: Vec<u8> = Vec::with_capacity(total * INDICES_PER_SPRITE * 2);
-        let mut slices = Vec::with_capacity(runs.len());
+        self.vertex_bytes
+            .reserve(total * VERTS_PER_SPRITE * VERTEX_STRIDE as usize);
+        self.index_bytes
+            .reserve(total * INDICES_PER_SPRITE * std::mem::size_of::<u16>());
+        self.staged_runs.reserve(runs.len());
         let mut vertex_base = 0u16;
         let mut index_cursor = 0u32;
-        for (sprites, atlas_wh) in runs {
+        for run in runs {
             let index_start = index_cursor;
-            for sprite in sprites.iter() {
-                push_sprite_vertices(&mut vertices, sprite, *atlas_wh, logical_size);
+            for sprite in &run.instances {
+                push_sprite_vertices(&mut self.vertex_bytes, sprite, run.atlas_size, logical_size);
                 for local in [0u16, 1, 2, 0, 2, 3] {
-                    indices.extend_from_slice(&(vertex_base + local).to_le_bytes());
+                    self.index_bytes
+                        .extend_from_slice(&(vertex_base + local).to_le_bytes());
                 }
                 vertex_base += VERTS_PER_SPRITE as u16;
                 index_cursor += INDICES_PER_SPRITE as u32;
             }
-            slices.push(SpriteRun {
+            self.staged_runs.push(SpriteRun {
                 index_start,
                 index_count: index_cursor - index_start,
             });
         }
-        queue.write_buffer(&self.vertex_buffer, 0, &vertices);
-        queue.write_buffer(&self.index_buffer, 0, &indices);
-        slices
+        queue.write_buffer(&self.vertex_buffer, 0, &self.vertex_bytes);
+        queue.write_buffer(&self.index_buffer, 0, &self.index_bytes);
+    }
+
+    /// Resolve a run staged by the current frame without exposing a borrow of
+    /// the scratch vector across subsequent batch draw calls.
+    pub(crate) fn staged_run(&self, slot: usize) -> Option<SpriteRun> {
+        self.staged_runs.get(slot).copied()
     }
 
     /// Draw one staged run, binding `atlas`'s texture.

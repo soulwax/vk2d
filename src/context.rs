@@ -10,6 +10,7 @@ use wgpu::{
 };
 use winit::window::Window;
 
+use crate::frame::FrameScratch;
 use crate::material::{Material, MaterialDesc, create_fallback_texture};
 use crate::sprite::{Filter, GpuTexture, SpriteBatch, create_gpu_texture};
 use crate::target::{SCENE_FORMAT, SceneTarget};
@@ -104,6 +105,8 @@ pub struct Context {
     /// in this crate, so a lazily-built entry stays valid for the target's
     /// whole lifetime.
     pub(crate) target_sprite_bind_groups: Vec<Option<wgpu::BindGroup>>,
+    /// CPU command/run storage recycled by successive immediate-mode frames.
+    pub(crate) frame_scratch: FrameScratch,
 }
 
 impl Context {
@@ -174,6 +177,7 @@ impl Context {
             fonts: Vec::new(),
             fallback_texture: None,
             target_sprite_bind_groups: Vec::new(),
+            frame_scratch: FrameScratch::default(),
         })
     }
 

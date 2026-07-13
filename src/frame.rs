@@ -6,7 +6,7 @@
 use wgpu::{CommandEncoderDescriptor, TextureViewDescriptor};
 
 use crate::color::{Color, Point, Rect2, SpriteParams, TextStyle};
-use crate::sprite::{SpriteInstance, SpriteSource};
+use crate::sprite::{SpriteDrawRun, SpriteInstance, SpriteSource};
 use crate::target::SceneTarget;
 use crate::view::View2;
 use crate::{Context, FontId, MaterialId, TargetId, TextureId, UniformValue, Vk2dError};
@@ -34,6 +34,16 @@ enum DrawCmd {
     Material(MaterialId),
     /// A font's accumulated text (drawn once per font).
     Text(FontId),
+}
+
+/// Recycled CPU-side frame recording storage owned by [`Context`] between
+/// frames. The vectors keep their high-water capacities, including one
+/// instance vector per concurrently recorded sprite run.
+#[derive(Default)]
+pub(crate) struct FrameScratch {
+    runs: Vec<SpriteDrawRun>,
+    cmds: Vec<DrawCmd>,
+    spare_instances: Vec<Vec<SpriteInstance>>,
 }
 
 /// Where a [`Frame`] renders its scene pass to, and how it finishes.
@@ -87,9 +97,14 @@ pub struct Frame<'ctx> {
     /// grows while consecutive `sprite()`/`target_sprite()` calls share a
     /// source; a different source (or an interleaved shape/material draw)
     /// starts a new run.
-    runs: Vec<(SpriteSource, Vec<SpriteInstance>)>,
+    runs: Vec<SpriteDrawRun>,
     /// Draw commands in submission order.
     cmds: Vec<DrawCmd>,
+    /// Instance buffers left over from prior frame runs, reused when a new run
+    /// starts instead of allocating a fresh one-element vector.
+    spare_instances: Vec<Vec<SpriteInstance>>,
+    /// Avoid an O(command_count) scan on every shape primitive.
+    shape_cmd_recorded: bool,
     /// The current 2D view: a CPU-side affine applied to every draw call's
     /// coordinates at record time, before the pixel→clip conversion. Defaults
     /// to [`View2::identity`] (no transform).
@@ -124,12 +139,15 @@ impl Context {
         for font in &mut self.fonts {
             font.begin_frame();
         }
+        let scratch = std::mem::take(&mut self.frame_scratch);
         Ok(Frame {
             ctx: self,
             dest: FrameDest::Swapchain { surface_texture },
             clear,
-            runs: Vec::new(),
-            cmds: Vec::new(),
+            runs: scratch.runs,
+            cmds: scratch.cmds,
+            spare_instances: scratch.spare_instances,
+            shape_cmd_recorded: false,
             view: View2::identity(),
         })
     }
@@ -157,12 +175,15 @@ impl Context {
         for font in &mut self.fonts {
             font.begin_frame();
         }
+        let scratch = std::mem::take(&mut self.frame_scratch);
         Ok(Frame {
             ctx: self,
             dest: FrameDest::Offscreen { index },
             clear,
-            runs: Vec::new(),
-            cmds: Vec::new(),
+            runs: scratch.runs,
+            cmds: scratch.cmds,
+            spare_instances: scratch.spare_instances,
+            shape_cmd_recorded: false,
             view: View2::identity(),
         })
     }
@@ -188,7 +209,11 @@ impl<'ctx> Frame<'ctx> {
         };
         let whole_source = [0.0, 0.0, tex.width, tex.height];
         let instance = self.build_sprite_instance(pos, params, whole_source);
-        self.push_sprite_instance(SpriteSource::Texture(texture), instance);
+        self.push_sprite_instance(
+            SpriteSource::Texture(texture),
+            (tex.width, tex.height),
+            instance,
+        );
     }
 
     /// Draw a finished render target's own color output as a positioned
@@ -226,7 +251,7 @@ impl<'ctx> Frame<'ctx> {
         let (w, h) = scene.size();
         let whole_source = [0.0, 0.0, w as f32, h as f32];
         let instance = self.build_sprite_instance(pos, params, whole_source);
-        self.push_sprite_instance(SpriteSource::Target(target), instance);
+        self.push_sprite_instance(SpriteSource::Target(target), (w as f32, h as f32), instance);
     }
 
     /// Build a [`SpriteInstance`] from `pos` (top-left) + `params`, applying
@@ -294,15 +319,25 @@ impl<'ctx> Frame<'ctx> {
     /// the last draw shared this exact source; otherwise open a new run
     /// (preserves painter ordering across sources and interleaved
     /// shape/material draws).
-    fn push_sprite_instance(&mut self, source: SpriteSource, instance: SpriteInstance) {
+    fn push_sprite_instance(
+        &mut self,
+        source: SpriteSource,
+        atlas_size: (f32, f32),
+        instance: SpriteInstance,
+    ) {
         if let Some(DrawCmd::Sprites(s, slot)) = self.cmds.last()
             && *s == source
         {
-            self.runs[*slot].1.push(instance);
+            self.runs[*slot].instances.push(instance);
             return;
         }
         let slot = self.runs.len();
-        self.runs.push((source, vec![instance]));
+        let mut instances = self.spare_instances.pop().unwrap_or_default();
+        instances.push(instance);
+        self.runs.push(SpriteDrawRun {
+            atlas_size,
+            instances,
+        });
         self.cmds.push(DrawCmd::Sprites(source, slot));
     }
 
@@ -311,8 +346,9 @@ impl<'ctx> Frame<'ctx> {
         // record the Shapes command exactly once (at the first shape draw). v0.1
         // simplification: shapes composite as one layer at their first
         // appearance rather than interleaving per-call with sprites/materials.
-        if !self.cmds.iter().any(|c| matches!(c, DrawCmd::Shapes)) {
+        if !self.shape_cmd_recorded {
             self.cmds.push(DrawCmd::Shapes);
+            self.shape_cmd_recorded = true;
         }
     }
 
@@ -536,6 +572,8 @@ impl<'ctx> Frame<'ctx> {
             clear,
             runs,
             cmds,
+            mut spare_instances,
+            shape_cmd_recorded: _,
             view: _,
         } = self;
         let ls = ctx.logical_size;
@@ -544,29 +582,6 @@ impl<'ctx> Frame<'ctx> {
         for font in &mut ctx.fonts {
             font.upload(&ctx.device, &ctx.queue);
         }
-        let staged: Vec<(&[SpriteInstance], (f32, f32))> = runs
-            .iter()
-            .map(|(source, instances)| {
-                let wh = match source {
-                    SpriteSource::Texture(tex) => ctx
-                        .textures
-                        .get(tex.0 as usize)
-                        .map(|g| (g.width, g.height))
-                        .unwrap_or((1.0, 1.0)),
-                    SpriteSource::Target(target) => ctx
-                        .targets
-                        .get(target.0 as usize)
-                        .map(|t| {
-                            let (w, h) = t.size();
-                            (w as f32, h as f32)
-                        })
-                        .unwrap_or((1.0, 1.0)),
-                };
-                (instances.as_slice(), wh)
-            })
-            .collect();
-        let slots = ctx.sprites.stage(&ctx.device, &ctx.queue, &staged, ls);
-
         let target_index = match &dest {
             FrameDest::Swapchain { .. } => 0,
             FrameDest::Offscreen { index } => *index,
@@ -586,6 +601,8 @@ impl<'ctx> Frame<'ctx> {
             }
         }
 
+        ctx.sprites.stage(&ctx.device, &ctx.queue, &runs, ls);
+
         let mut encoder = ctx
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
@@ -598,13 +615,13 @@ impl<'ctx> Frame<'ctx> {
                 match cmd {
                     DrawCmd::Shapes => ctx.shapes.draw(&mut pass),
                     DrawCmd::Sprites(source, slot) => {
-                        let Some(run) = slots.get(*slot) else {
+                        let Some(run) = ctx.sprites.staged_run(*slot) else {
                             continue;
                         };
                         match source {
                             SpriteSource::Texture(tex) => {
                                 if let Some(gpu) = ctx.textures.get(tex.0 as usize) {
-                                    ctx.sprites.draw_run(&mut pass, *run, gpu);
+                                    ctx.sprites.draw_run(&mut pass, run, gpu);
                                 }
                             }
                             SpriteSource::Target(target) => {
@@ -618,7 +635,7 @@ impl<'ctx> Frame<'ctx> {
                                     ctx.target_sprite_bind_groups.get(index)
                                 {
                                     ctx.sprites
-                                        .draw_run_with_bind_group(&mut pass, *run, bind_group);
+                                        .draw_run_with_bind_group(&mut pass, run, bind_group);
                                 }
                             }
                         }
@@ -651,6 +668,18 @@ impl<'ctx> Frame<'ctx> {
         };
 
         ctx.queue.submit(std::iter::once(encoder.finish()));
+        let mut runs = runs;
+        for mut run in runs.drain(..) {
+            run.instances.clear();
+            spare_instances.push(run.instances);
+        }
+        let mut cmds = cmds;
+        cmds.clear();
+        ctx.frame_scratch = FrameScratch {
+            runs,
+            cmds,
+            spare_instances,
+        };
         (ctx, surface_texture)
     }
 }

@@ -20,6 +20,7 @@ use wgpu::{
 };
 
 use crate::blend::BlendMode;
+use crate::handles::{TargetId, TextureId};
 
 /// Texture sampling filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,20 @@ impl Filter {
 const VERTEX_STRIDE: BufferAddress = 32;
 const VERTS_PER_SPRITE: usize = 4;
 const INDICES_PER_SPRITE: usize = 6;
+
+/// What a sprite run samples: an uploaded texture, or a finished render
+/// target's own color output (the `target_sprite` path — drawing a prior
+/// pass's result as a positioned blit, e.g. compositing an offscreen effect
+/// into the scene). Extends the batch key alongside `TextureId` so the two
+/// sources can never be confused at the batching layer; each still resolves
+/// to one bind group at draw time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SpriteSource {
+    /// An app-uploaded texture, indexed into `Context::textures`.
+    Texture(TextureId),
+    /// A render target's color output, indexed into `Context::targets`.
+    Target(TargetId),
+}
 
 /// One sprite to draw, in logical-pixel space (origin top-left). Produced by the
 /// frame API from a `TextureId` + `SpriteParams`.
@@ -194,14 +209,58 @@ impl SpriteBatch {
         run: SpriteRun,
         atlas: &'pass GpuTexture,
     ) {
+        self.draw_run_with_bind_group(pass, run, &atlas.bind_group);
+    }
+
+    /// Draw one staged run with an explicit bind group — the shared path
+    /// behind [`Self::draw_run`] (an uploaded texture's own bind group) and
+    /// `target_sprite` (a render target's color view/sampler bound into a
+    /// bind group built with this same pipeline's layout via
+    /// [`Self::build_source_bind_group`]). Both sources share one pipeline
+    /// and vertex format, so only the bind group differs.
+    pub(crate) fn draw_run_with_bind_group<'pass>(
+        &'pass self,
+        pass: &mut RenderPass<'pass>,
+        run: SpriteRun,
+        bind_group: &'pass BindGroup,
+    ) {
         if run.index_count == 0 {
             return;
         }
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &atlas.bind_group, &[]);
+        pass.set_bind_group(0, bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint16);
         pass.draw_indexed(run.index_start..run.index_start + run.index_count, 0, 0..1);
+    }
+
+    /// Build a bind group for this batch's pipeline from an arbitrary
+    /// view/sampler pair — the hookup for `target_sprite`, which sources a
+    /// render target's own color output (`SceneTarget::color_view`/
+    /// `color_sampler`) rather than an entry in the texture registry.
+    /// Structurally identical to a `GpuTexture`'s bind group (same layout:
+    /// texture at binding 0, sampler at binding 1), so the shared pipeline
+    /// draws either source without caring which it is.
+    pub(crate) fn build_source_bind_group(
+        &self,
+        device: &Device,
+        view: &TextureView,
+        sampler: &Sampler,
+    ) -> BindGroup {
+        device.create_bind_group(&BindGroupDescriptor {
+            label: Some("vk2d.sprite.target_source.bind_group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Sampler(sampler),
+                },
+            ],
+        })
     }
 
     fn grow(&mut self, device: &Device, needed: usize) {
@@ -447,4 +506,50 @@ fn create_empty_buffer(
         usage,
         mapped_at_creation: false,
     })
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    // `SpriteSource` is the batch key `Frame::push_sprite_instance` compares
+    // (`self.cmds.last()` vs the new draw's source) to decide whether to
+    // extend the current run or open a new one. These pure equality checks
+    // lock that contract: a `Texture` and a `Target` sharing the same raw
+    // index must never compare equal (otherwise a target_sprite draw could
+    // silently batch into a same-index texture's run and sample the wrong
+    // bind group), and same-variant/same-index must compare equal (so
+    // consecutive `target_sprite` calls for one target still batch into a
+    // single draw, matching how consecutive `sprite()` calls of one texture
+    // do today).
+    #[test]
+    fn texture_and_target_sources_never_compare_equal_even_at_the_same_index() {
+        let tex = SpriteSource::Texture(TextureId(0));
+        let target = SpriteSource::Target(TargetId(0));
+        assert_ne!(tex, target);
+    }
+
+    #[test]
+    fn same_variant_same_index_sources_compare_equal() {
+        assert_eq!(
+            SpriteSource::Texture(TextureId(2)),
+            SpriteSource::Texture(TextureId(2))
+        );
+        assert_eq!(
+            SpriteSource::Target(TargetId(1)),
+            SpriteSource::Target(TargetId(1))
+        );
+    }
+
+    #[test]
+    fn same_variant_different_index_sources_are_distinct() {
+        assert_ne!(
+            SpriteSource::Target(TargetId(1)),
+            SpriteSource::Target(TargetId(2))
+        );
+        assert_ne!(
+            SpriteSource::Texture(TextureId(1)),
+            SpriteSource::Texture(TextureId(2))
+        );
+    }
 }

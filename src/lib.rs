@@ -38,7 +38,7 @@ pub use input::InputState;
 
 pub use blend::BlendMode;
 pub use color::{Color, Point, Rect2, SpriteParams, TextStyle};
-pub use context::{Backend, Context, ContextConfig};
+pub use context::{Backend, Context, ContextConfig, TextMetricsExt};
 pub use error::Vk2dError;
 pub use frame::Frame;
 pub use handles::{FontId, MaterialId, TargetId, TextureId};

@@ -6,7 +6,7 @@
 use wgpu::{CommandEncoderDescriptor, TextureViewDescriptor};
 
 use crate::color::{Color, Point, Rect2, SpriteParams, TextStyle};
-use crate::sprite::SpriteInstance;
+use crate::sprite::{SpriteInstance, SpriteSource};
 use crate::target::SceneTarget;
 use crate::view::View2;
 use crate::{Context, FontId, MaterialId, TargetId, TextureId, UniformValue, Vk2dError};
@@ -23,9 +23,11 @@ fn wgpu_color(c: Color) -> wgpu::Color {
 /// One accumulated draw, kept in submission order so overlapping draws layer
 /// correctly (painter's algorithm).
 enum DrawCmd {
-    /// A sprite run: `(texture, run_slot)` where `run_slot` indexes the frame's
-    /// ordered `runs` list (each entry is instances + that texture id).
-    Sprites(TextureId, usize),
+    /// A sprite run: `(source, run_slot)` where `run_slot` indexes the frame's
+    /// ordered `runs` list (each entry is instances + that source). `source`
+    /// is either an uploaded texture ([`Frame::sprite`]) or a finished render
+    /// target's own color output ([`Frame::target_sprite`]).
+    Sprites(SpriteSource, usize),
     /// The shape batch (all accumulated shapes; drawn once).
     Shapes,
     /// A material drawn fullscreen into the scene.
@@ -50,6 +52,30 @@ enum FrameDest {
     Offscreen { index: usize },
 }
 
+impl FrameDest {
+    /// The `targets` index this frame's scene pass renders into: always `0`
+    /// for `Swapchain` (the reserved scene target — see
+    /// [`Context::ensure_scene`]), or the chosen index for `Offscreen`.
+    /// [`Frame::target_sprite`]'s self-sample guard compares a requested
+    /// target against this.
+    fn render_index(&self) -> usize {
+        match self {
+            FrameDest::Swapchain { .. } => 0,
+            FrameDest::Offscreen { index } => *index,
+        }
+    }
+}
+
+/// Pure predicate behind `target_sprite`'s self-sample guard: would drawing
+/// `requested_index` sample the same target this frame is currently rendering
+/// into (`render_index`)? Extracted so the guard's logic — the crux of the
+/// contract, since getting it wrong is a wgpu COLOR_TARGET/RESOURCE aliasing
+/// crash rather than a graceful no-op — is unit-testable without a GPU
+/// device, a window, or a live `Frame`.
+fn is_self_sampling(render_index: usize, requested_index: usize) -> bool {
+    render_index == requested_index
+}
+
 /// A frame in progress. Draw into it, then call [`Frame::present`] (swapchain
 /// frames) or [`Frame::finish`] (offscreen target frames — does not present).
 pub struct Frame<'ctx> {
@@ -57,10 +83,11 @@ pub struct Frame<'ctx> {
     dest: FrameDest,
     /// Background clear colour for the scene pass.
     clear: Color,
-    /// Sprite runs in submission order: each is a texture + its instances. A run
-    /// grows while consecutive `sprite()` calls share a texture; a different
-    /// texture (or an interleaved shape/material draw) starts a new run.
-    runs: Vec<(TextureId, Vec<SpriteInstance>)>,
+    /// Sprite runs in submission order: each is a source + its instances. A run
+    /// grows while consecutive `sprite()`/`target_sprite()` calls share a
+    /// source; a different source (or an interleaved shape/material draw)
+    /// starts a new run.
+    runs: Vec<(SpriteSource, Vec<SpriteInstance>)>,
     /// Draw commands in submission order.
     cmds: Vec<DrawCmd>,
     /// The current 2D view: a CPU-side affine applied to every draw call's
@@ -159,11 +186,66 @@ impl<'ctx> Frame<'ctx> {
         let Some(tex) = self.ctx.textures.get(texture.0 as usize) else {
             return;
         };
-        // Source rect defaults to the whole texture.
+        let whole_source = [0.0, 0.0, tex.width, tex.height];
+        let instance = self.build_sprite_instance(pos, params, whole_source);
+        self.push_sprite_instance(SpriteSource::Texture(texture), instance);
+    }
+
+    /// Draw a finished render target's own color output as a positioned
+    /// sprite at `pos` (top-left) with the given params — compositing a prior
+    /// offscreen pass into this frame's scene (e.g. a blur or bloom target).
+    ///
+    /// `target` must have already been rendered and finished in an earlier
+    /// frame or an earlier pass in the same sequence; this call does not
+    /// itself schedule any rendering (mirrors [`Frame::bind_material_target`]).
+    /// Unknown target id is a no-op (no panic).
+    ///
+    /// **Self-sample guard:** drawing the target THIS frame is currently
+    /// rendering into is a caller error, not a wgpu validation crash waiting
+    /// to happen (sampling a texture that's simultaneously bound as the
+    /// active color attachment is a COLOR_TARGET/RESOURCE usage conflict wgpu
+    /// rejects at submit time). Both frame flavours are guarded: an offscreen
+    /// frame ([`Context::begin_target_frame`]) checks `target` against its own
+    /// `FrameDest::Offscreen { index }`, and a swapchain frame
+    /// ([`Context::begin_frame`]) checks it against the reserved scene target
+    /// (index 0 — see [`Context::ensure_scene`]), since that's the target a
+    /// swapchain frame renders into. Either match logs at debug level and
+    /// returns without queuing a draw.
+    pub fn target_sprite(&mut self, target: TargetId, pos: Point, params: SpriteParams) {
+        let requested_index = target.0 as usize;
+        if is_self_sampling(self.dest.render_index(), requested_index) {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "vk2d: target_sprite({requested_index}) ignored — that target is the one this frame is currently rendering into (self-sample guard)"
+            );
+            return;
+        }
+        let Some(scene) = self.ctx.targets.get(requested_index) else {
+            return;
+        };
+        let (w, h) = scene.size();
+        let whole_source = [0.0, 0.0, w as f32, h as f32];
+        let instance = self.build_sprite_instance(pos, params, whole_source);
+        self.push_sprite_instance(SpriteSource::Target(target), instance);
+    }
+
+    /// Build a [`SpriteInstance`] from `pos` (top-left) + `params`, applying
+    /// the current [`View2`] exactly like [`Frame::sprite`] — shared by
+    /// `sprite` and `target_sprite` so a target-as-texture blit transforms
+    /// identically to an ordinary texture sprite. `whole_source` is the
+    /// source's full-size rect (`[0, 0, w, h]`), substituted when
+    /// `params.source_px` is `None`.
+    fn build_sprite_instance(
+        &self,
+        pos: Point,
+        params: SpriteParams,
+        whole_source: [f32; 4],
+    ) -> SpriteInstance {
+        // Source rect defaults to the whole source.
         let mut source_px = params
             .source_px
             .map(|r| [r.x, r.y, r.w, r.h])
-            .unwrap_or([0.0, 0.0, tex.width, tex.height]);
+            .unwrap_or(whole_source);
         let size = params
             .dest_size
             .map(|d| [d.x, d.y])
@@ -200,24 +282,28 @@ impl<'ctx> Frame<'ctx> {
             size[0] * self.view.scale.x.abs(),
             size[1] * self.view.scale.y.abs(),
         ];
-        let instance = SpriteInstance {
+        SpriteInstance {
             center: [center.x, center.y],
             size,
             source_px,
             tint: [tint.r, tint.g, tint.b, tint.a],
-        };
-        // Extend the current run if the last draw was sprites of this texture;
-        // otherwise open a new run (preserves painter ordering across textures
-        // and interleaved shape/material draws).
-        if let Some(DrawCmd::Sprites(t, slot)) = self.cmds.last()
-            && t.0 == texture.0
+        }
+    }
+
+    /// Append `instance` to the run for `source`: extend the current run if
+    /// the last draw shared this exact source; otherwise open a new run
+    /// (preserves painter ordering across sources and interleaved
+    /// shape/material draws).
+    fn push_sprite_instance(&mut self, source: SpriteSource, instance: SpriteInstance) {
+        if let Some(DrawCmd::Sprites(s, slot)) = self.cmds.last()
+            && *s == source
         {
             self.runs[*slot].1.push(instance);
             return;
         }
         let slot = self.runs.len();
-        self.runs.push((texture, vec![instance]));
-        self.cmds.push(DrawCmd::Sprites(texture, slot));
+        self.runs.push((source, vec![instance]));
+        self.cmds.push(DrawCmd::Sprites(source, slot));
     }
 
     fn ensure_shape_cmd(&mut self) {
@@ -460,12 +546,22 @@ impl<'ctx> Frame<'ctx> {
         }
         let staged: Vec<(&[SpriteInstance], (f32, f32))> = runs
             .iter()
-            .map(|(tex, instances)| {
-                let wh = ctx
-                    .textures
-                    .get(tex.0 as usize)
-                    .map(|g| (g.width, g.height))
-                    .unwrap_or((1.0, 1.0));
+            .map(|(source, instances)| {
+                let wh = match source {
+                    SpriteSource::Texture(tex) => ctx
+                        .textures
+                        .get(tex.0 as usize)
+                        .map(|g| (g.width, g.height))
+                        .unwrap_or((1.0, 1.0)),
+                    SpriteSource::Target(target) => ctx
+                        .targets
+                        .get(target.0 as usize)
+                        .map(|t| {
+                            let (w, h) = t.size();
+                            (w as f32, h as f32)
+                        })
+                        .unwrap_or((1.0, 1.0)),
+                };
                 (instances.as_slice(), wh)
             })
             .collect();
@@ -475,6 +571,20 @@ impl<'ctx> Frame<'ctx> {
             FrameDest::Swapchain { .. } => 0,
             FrameDest::Offscreen { index } => *index,
         };
+
+        // Pre-warm every target-sprite bind group this frame's `cmds` need,
+        // BEFORE the scene render pass borrows `ctx.targets` (and therefore
+        // `ctx`) immutably for its lifetime. `target_sprite_bind_group` takes
+        // `&mut Context`, which the borrow checker cannot interleave with a
+        // live `RenderPass` borrowed from `&ctx.targets[target_index]`.
+        for cmd in &cmds {
+            if let DrawCmd::Sprites(SpriteSource::Target(target), _) = cmd {
+                let index = target.0 as usize;
+                if index < ctx.targets.len() {
+                    ctx.target_sprite_bind_group(index);
+                }
+            }
+        }
 
         let mut encoder = ctx
             .device
@@ -487,11 +597,30 @@ impl<'ctx> Frame<'ctx> {
             for cmd in &cmds {
                 match cmd {
                     DrawCmd::Shapes => ctx.shapes.draw(&mut pass),
-                    DrawCmd::Sprites(tex, slot) => {
-                        if let (Some(run), Some(gpu)) =
-                            (slots.get(*slot), ctx.textures.get(tex.0 as usize))
-                        {
-                            ctx.sprites.draw_run(&mut pass, *run, gpu);
+                    DrawCmd::Sprites(source, slot) => {
+                        let Some(run) = slots.get(*slot) else {
+                            continue;
+                        };
+                        match source {
+                            SpriteSource::Texture(tex) => {
+                                if let Some(gpu) = ctx.textures.get(tex.0 as usize) {
+                                    ctx.sprites.draw_run(&mut pass, *run, gpu);
+                                }
+                            }
+                            SpriteSource::Target(target) => {
+                                let index = target.0 as usize;
+                                // Already built by the pre-warm pass above (it
+                                // ran before `pass` — which borrows
+                                // `ctx.targets` — existed), so this is a plain
+                                // read: no `&mut ctx` call can happen while
+                                // `pass` is alive.
+                                if let Some(Some(bind_group)) =
+                                    ctx.target_sprite_bind_groups.get(index)
+                                {
+                                    ctx.sprites
+                                        .draw_run_with_bind_group(&mut pass, *run, bind_group);
+                                }
+                            }
                         }
                     }
                     DrawCmd::Material(mat) => {
@@ -523,5 +652,56 @@ impl<'ctx> Frame<'ctx> {
 
         ctx.queue.submit(std::iter::once(encoder.finish()));
         (ctx, surface_texture)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `target_sprite`'s self-sample guard is the crux of its contract:
+    // drawing the target a frame is currently rendering INTO must no-op
+    // (never reach wgpu, which would reject it as a COLOR_TARGET/RESOURCE
+    // usage conflict at submit time). vk2d has no headless `wgpu::Device`
+    // test harness (`Context::new` requires a real `winit::Window`, and
+    // `FrameDest::Swapchain` holds a real `wgpu::SurfaceTexture` that can't be
+    // constructed off-GPU), so per the task brief's fallback these test the
+    // extracted pure predicate directly rather than a live `Frame` — both
+    // frame flavours it stands in for (`Offscreen` and the reserved-scene
+    // `Swapchain` case) are exercised via `render_index`'s two arms.
+
+    #[test]
+    fn offscreen_frame_guards_its_own_target() {
+        // Frame::begin_target_frame(target) — render_index() is that target's
+        // index. Drawing target 3 while rendering into target 3 must guard.
+        let render_index = FrameDest::Offscreen { index: 3 }.render_index();
+        assert!(is_self_sampling(render_index, 3));
+        // A different target is unaffected.
+        assert!(!is_self_sampling(render_index, 0));
+        assert!(!is_self_sampling(render_index, 4));
+    }
+
+    #[test]
+    fn swapchain_frame_guards_the_reserved_scene_target() {
+        // A swapchain frame (Context::begin_frame) always renders into the
+        // reserved scene target, index 0 (Context::ensure_scene). We can't
+        // construct a real `FrameDest::Swapchain` off-GPU (it owns a
+        // `wgpu::SurfaceTexture`), so this asserts the documented invariant
+        // `render_index() == 0` directly against the predicate a swapchain
+        // frame's `target_sprite` call would evaluate.
+        let render_index = 0usize; // FrameDest::Swapchain::render_index()
+        assert!(is_self_sampling(render_index, 0));
+        // Any other target is a legitimate, un-guarded draw.
+        assert!(!is_self_sampling(render_index, 1));
+        assert!(!is_self_sampling(render_index, 7));
+    }
+
+    #[test]
+    fn is_self_sampling_is_pure_index_equality() {
+        for (render_index, requested, expected) in
+            [(0, 0, true), (1, 1, true), (2, 3, false), (5, 2, false)]
+        {
+            assert_eq!(is_self_sampling(render_index, requested), expected);
+        }
     }
 }

@@ -54,6 +54,20 @@ impl Default for ContextConfig {
     }
 }
 
+/// Text metrics from [`Context::measure_text_ext`]: the same `(width, height)`
+/// as [`Context::measure_text`], plus `offset_y` — the baseline's distance
+/// from the line's top, in logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TextMetricsExt {
+    /// The pen-advance width of the measured text, in logical pixels.
+    pub width: f32,
+    /// The baked line height at the requested size, in logical pixels.
+    pub height: f32,
+    /// Distance from the line's top down to its baseline, in logical pixels —
+    /// the same offset [`crate::Frame::text`] adds internally when drawing.
+    pub offset_y: f32,
+}
+
 /// Owns the GPU device/queue, the window surface, and (as later tasks add them)
 /// the texture/material/font/target registries. Construct one per window with
 /// [`Context::new`].
@@ -83,6 +97,13 @@ pub struct Context {
     /// [`Context::fallback_texture`] (most apps never touch texture
     /// materials, so most contexts never pay for it).
     fallback_texture: Option<(TextureView, Sampler)>,
+    /// Bind groups for sourcing a render target as a sprite ([`crate::Frame::target_sprite`]),
+    /// indexed parallel to `targets` and built lazily the first time each
+    /// target is drawn that way — mirrors how a `GpuTexture`'s bind group is
+    /// built once at load rather than rebuilt per draw. Targets never resize
+    /// in this crate, so a lazily-built entry stays valid for the target's
+    /// whole lifetime.
+    pub(crate) target_sprite_bind_groups: Vec<Option<wgpu::BindGroup>>,
 }
 
 impl Context {
@@ -152,6 +173,7 @@ impl Context {
             shapes,
             fonts: Vec::new(),
             fallback_texture: None,
+            target_sprite_bind_groups: Vec::new(),
         })
     }
 
@@ -186,6 +208,31 @@ impl Context {
             .get(font.0 as usize)
             .map(|f| f.measure(text, style.size))
             .unwrap_or((0.0, 0.0))
+    }
+
+    /// Measure `text` in `font` at `style.size`, plus `offset_y`: the distance
+    /// from the line's top (the `pos.y` a caller would pass to
+    /// [`crate::Frame::text`]) down to its baseline, in logical pixels. Callers
+    /// that lay out text against a baseline (aligning mixed-size runs, drawing
+    /// an underline, or vertically centering multi-line labels) need this in
+    /// addition to the raw `(width, height)` [`Context::measure_text`] gives.
+    /// `offset_y` is computed by the exact same scale expression the draw path
+    /// ([`crate::Frame::text`]) uses, so it always matches what actually
+    /// renders. Returns all-zero metrics for an unknown font.
+    pub fn measure_text_ext(&self, font: FontId, text: &str, style: TextStyle) -> TextMetricsExt {
+        let Some(renderer) = self.fonts.get(font.0 as usize) else {
+            return TextMetricsExt {
+                width: 0.0,
+                height: 0.0,
+                offset_y: 0.0,
+            };
+        };
+        let (width, height) = renderer.measure(text, style.size);
+        TextMetricsExt {
+            width,
+            height,
+            offset_y: renderer.baseline_offset(style.size),
+        }
     }
 
     /// Raw wgpu device — an escape hatch for the optional `egui` integration,
@@ -336,7 +383,31 @@ impl Context {
         let target = SceneTarget::new(&self.device, width, height, self.config.format);
         let id = TargetId(self.targets.len() as u32);
         self.targets.push(target);
+        // Kept parallel to `targets`: `target_sprite`'s bind-group cache is
+        // built lazily per index on first use, not here.
+        self.target_sprite_bind_groups.push(None);
         id
+    }
+
+    /// The cached bind group for sourcing `targets[index]` as a sprite
+    /// ([`crate::Frame::target_sprite`]), building it on first use. Reused on
+    /// later calls the same way a `GpuTexture`'s bind group is built once at
+    /// load — targets never resize in this crate, so the cached entry stays
+    /// valid for the target's whole lifetime. `index` must already be a valid
+    /// `targets` index; callers (`Frame::target_sprite`) check that first.
+    pub(crate) fn target_sprite_bind_group(&mut self, index: usize) -> &wgpu::BindGroup {
+        if self.target_sprite_bind_groups[index].is_none() {
+            let scene = &self.targets[index];
+            let view = scene.color_view();
+            let sampler = scene.color_sampler();
+            let bind_group = self
+                .sprites
+                .build_source_bind_group(&self.device, view, sampler);
+            self.target_sprite_bind_groups[index] = Some(bind_group);
+        }
+        self.target_sprite_bind_groups[index]
+            .as_ref()
+            .expect("just inserted above")
     }
 
     /// A human-readable description of the selected adapter (name, backend,

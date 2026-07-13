@@ -60,6 +60,10 @@ pub(crate) struct SceneTarget {
     bind_group_layout: BindGroupLayout,
     bind_group: BindGroup,
     blit_pipeline: RenderPipeline,
+    /// The target's pixel size — needed to source it as a sprite (UV math
+    /// against its own dimensions, same as any other texture).
+    width: u32,
+    height: u32,
 }
 
 impl SceneTarget {
@@ -83,7 +87,15 @@ impl SceneTarget {
             bind_group_layout,
             bind_group,
             blit_pipeline,
+            width: width.max(1),
+            height: height.max(1),
         }
+    }
+
+    /// The target's pixel size (`width.max(1), height.max(1)` — matches the
+    /// texture actually allocated).
+    pub(crate) fn size(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 
     /// Begin the scene pass: clears the target to `clear` and returns a render

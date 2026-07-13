@@ -139,7 +139,7 @@ impl TextRenderer {
     /// Measure `text` at `px` height: `(width, height)` in logical pixels. The
     /// width is the pen advance; the height is the baked line height scaled.
     pub(crate) fn measure(&self, text: &str, px: f32) -> (f32, f32) {
-        let scale = px / self.baked_px;
+        let scale = text_scale(px, self.baked_px);
         let mut width = 0.0;
         for ch in text.chars() {
             match self.glyphs.get(&ch) {
@@ -148,6 +148,16 @@ impl TextRenderer {
             }
         }
         (width, px)
+    }
+
+    /// Distance from a line's top (the `origin.y` passed to [`Self::queue_text`])
+    /// down to its baseline, in logical pixels, at `px` height. Delegates to
+    /// [`baseline_offset_from`], the exact same expression
+    /// [`Self::queue_text`] adds to `origin.y` before rounding — so
+    /// measurement and drawing can never disagree about where the baseline
+    /// lands.
+    pub(crate) fn baseline_offset(&self, px: f32) -> f32 {
+        baseline_offset_from(self.ascent, px, self.baked_px)
     }
 
     /// Clear the frame's glyph accumulation.
@@ -167,9 +177,9 @@ impl TextRenderer {
         color: [f32; 4],
         logical_size: (u32, u32),
     ) {
-        let scale = px / self.baked_px;
+        let scale = text_scale(px, self.baked_px);
         let mut pen_x = origin[0].round();
-        let baseline = origin[1].round() + self.ascent * scale;
+        let baseline = origin[1].round() + baseline_offset_from(self.ascent, px, self.baked_px);
         for ch in text.chars() {
             let Some(glyph) = self.glyphs.get(&ch).copied() else {
                 pen_x += self.baked_px * 0.3 * scale;
@@ -242,6 +252,25 @@ impl TextRenderer {
         );
         self.capacity_glyphs = capacity;
     }
+}
+
+/// The single scale expression shared by drawing ([`TextRenderer::queue_text`])
+/// and measurement ([`TextRenderer::measure`], [`TextRenderer::baseline_offset`]):
+/// requested pixel height over the size the atlas was baked at. Every caller
+/// that needs "how big does a baked glyph render" goes through this function
+/// so draw and measure can never compute a different scale for the same
+/// inputs.
+fn text_scale(px: f32, baked_px: f32) -> f32 {
+    px / baked_px
+}
+
+/// Distance from a line's top down to its baseline at `px` height, given the
+/// font's baked `ascent` (in baked-atlas pixels) and the size it was baked at.
+/// [`TextRenderer::queue_text`] adds this to `origin.y` (before rounding);
+/// [`TextRenderer::baseline_offset`] — and therefore `measure_text_ext` —
+/// returns the identical value. One function, one place either could diverge.
+fn baseline_offset_from(ascent: f32, px: f32, baked_px: f32) -> f32 {
+    ascent * text_scale(px, baked_px)
 }
 
 struct AtlasBake {
@@ -512,4 +541,52 @@ fn create_empty_buffer(
         usage,
         mapped_at_creation: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pure arithmetic tests: no GPU device and no real font needed. vk2d never
+    // vendors font files (the app supplies TTF bytes), so these exercise the
+    // exact scale/baseline expressions `queue_text` and `measure`/
+    // `baseline_offset` share, using synthetic ascent/baked_px values instead
+    // of a rasterized font.
+
+    #[test]
+    fn text_scale_is_requested_over_baked_px() {
+        assert_eq!(text_scale(32.0, 16.0), 2.0);
+        assert_eq!(text_scale(16.0, 16.0), 1.0);
+        assert_eq!(text_scale(8.0, 16.0), 0.5);
+    }
+
+    #[test]
+    fn baseline_offset_from_scales_ascent_by_text_scale() {
+        // A font baked at 16px with a 12.8px ascent (0.8 ratio, fontdue's own
+        // fallback ratio when a font lacks line metrics), requested at 32px:
+        // the baseline should sit at ascent * (32/16) = 25.6px below the top.
+        let offset = baseline_offset_from(12.8, 32.0, 16.0);
+        assert!((offset - 25.6).abs() < 1e-4);
+    }
+
+    #[test]
+    fn baseline_offset_from_matches_queue_text_expression() {
+        // Same expression `queue_text` uses inline: origin.y.round() + this
+        // term. Confirm the two independent-looking call sites reduce to
+        // identical floats for a range of sizes, so `measure_text_ext`
+        // (which calls `baseline_offset`) can never silently drift from what
+        // gets drawn.
+        let ascent = 20.0;
+        let baked_px = 24.0;
+        for px in [8.0, 16.0, 24.0, 48.0, 100.0] {
+            let via_helper = baseline_offset_from(ascent, px, baked_px);
+            let inline_equivalent = ascent * (px / baked_px);
+            assert_eq!(via_helper, inline_equivalent);
+        }
+    }
+
+    #[test]
+    fn baseline_offset_is_positive_for_positive_ascent_and_size() {
+        assert!(baseline_offset_from(10.0, 24.0, 16.0) > 0.0);
+    }
 }

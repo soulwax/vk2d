@@ -26,6 +26,7 @@ mod shapes;
 mod sprite;
 mod target;
 mod text;
+mod view;
 
 /// Re-export egui so consumers build UI against the exact version vk2d links.
 #[cfg(feature = "egui")]
@@ -43,6 +44,7 @@ pub use frame::Frame;
 pub use handles::{FontId, MaterialId, TargetId, TextureId};
 pub use material::{MaterialDesc, UniformType, UniformValue};
 pub use sprite::Filter;
+pub use view::View2;
 
 /// Internal helpers exposed for the crate's own integration tests. Not a
 /// stable public API — do not depend on it from applications.

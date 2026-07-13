@@ -8,6 +8,7 @@ use wgpu::{CommandEncoderDescriptor, TextureViewDescriptor};
 use crate::color::{Color, Point, Rect2, SpriteParams, TextStyle};
 use crate::sprite::SpriteInstance;
 use crate::target::SceneTarget;
+use crate::view::View2;
 use crate::{Context, FontId, MaterialId, TargetId, TextureId, UniformValue, Vk2dError};
 
 fn wgpu_color(c: Color) -> wgpu::Color {
@@ -62,6 +63,10 @@ pub struct Frame<'ctx> {
     runs: Vec<(TextureId, Vec<SpriteInstance>)>,
     /// Draw commands in submission order.
     cmds: Vec<DrawCmd>,
+    /// The current 2D view: a CPU-side affine applied to every draw call's
+    /// coordinates at record time, before the pixel→clip conversion. Defaults
+    /// to [`View2::identity`] (no transform).
+    view: View2,
 }
 
 impl Context {
@@ -98,6 +103,7 @@ impl Context {
             clear,
             runs: Vec::new(),
             cmds: Vec::new(),
+            view: View2::identity(),
         })
     }
 
@@ -130,18 +136,31 @@ impl Context {
             clear,
             runs: Vec::new(),
             cmds: Vec::new(),
+            view: View2::identity(),
         })
     }
 }
 
 impl<'ctx> Frame<'ctx> {
+    /// Replace the current view (see [`View2`]). Affects every draw call
+    /// recorded after this point; draws already recorded keep the
+    /// coordinates they were transformed with at record time.
+    pub fn set_view(&mut self, view: View2) {
+        self.view = view;
+    }
+
+    /// Reset the view back to [`View2::identity`] (no transform).
+    pub fn reset_view(&mut self) {
+        self.view = View2::identity();
+    }
+
     /// Draw a texture at `pos` (top-left) with the given params.
     pub fn sprite(&mut self, texture: TextureId, pos: Point, params: SpriteParams) {
         let Some(tex) = self.ctx.textures.get(texture.0 as usize) else {
             return;
         };
         // Source rect defaults to the whole texture.
-        let source_px = params
+        let mut source_px = params
             .source_px
             .map(|r| [r.x, r.y, r.w, r.h])
             .unwrap_or([0.0, 0.0, tex.width, tex.height]);
@@ -150,10 +169,39 @@ impl<'ctx> Frame<'ctx> {
             .map(|d| [d.x, d.y])
             .unwrap_or([source_px[2], source_px[3]]);
         let tint = params.tint;
-        // Convert top-left pos to a centre (the batch draws centred quads).
+        // A Y-up view (negative scale.y) flips the source vertically on
+        // screen; XOR that correction into flip_y so the texture stays
+        // upright, matching how a Y-up camera samples a normally-oriented
+        // texture atlas. Both flip_x and the (possibly corrected) flip_y are
+        // realized by mirroring the source rect on that axis (swap its min
+        // and max edge), which the vertex builder turns into flipped UVs
+        // without needing a dedicated flip field on `SpriteInstance`.
+        let flip_x = params.flip_x;
+        let flip_y = params.flip_y ^ (self.view.scale.y < 0.0);
+        if flip_x {
+            source_px[0] += source_px[2];
+            source_px[2] = -source_px[2];
+        }
+        if flip_y {
+            source_px[1] += source_px[3];
+            source_px[3] = -source_px[3];
+        }
+        // Convert top-left pos to a centre (the batch draws centred quads),
+        // then transform the centre through the view; scale the size by the
+        // view's per-axis scale magnitude so it stays correctly sized (the
+        // flip itself is carried by the mirrored source rect above, not by a
+        // negative size).
         let center = [pos.x + size[0] * 0.5, pos.y + size[1] * 0.5];
+        let center = self.view.apply(Point {
+            x: center[0],
+            y: center[1],
+        });
+        let size = [
+            size[0] * self.view.scale.x.abs(),
+            size[1] * self.view.scale.y.abs(),
+        ];
         let instance = SpriteInstance {
-            center,
+            center: [center.x, center.y],
             size,
             source_px,
             tint: [tint.r, tint.g, tint.b, tint.a],
@@ -182,27 +230,62 @@ impl<'ctx> Frame<'ctx> {
         }
     }
 
+    /// Transform a [`Rect2`] (given as top-left + size) through the current
+    /// view: map the top-left corner and scale the size by the view's
+    /// per-axis scale magnitude, then slide the origin back by the negative
+    /// half when an axis flips — so a view with negative scale on either axis
+    /// still yields a rect with positive width/height. Width/height are
+    /// derived from `rect.w`/`rect.h` directly (never by re-differencing two
+    /// transformed corners), so an identity view reproduces the exact input
+    /// rect with no floating-point round-trip.
+    fn view_rect(&self, rect: Rect2) -> Rect2 {
+        let top_left = self.view.apply(Point {
+            x: rect.x,
+            y: rect.y,
+        });
+        let w = rect.w * self.view.scale.x.abs();
+        let h = rect.h * self.view.scale.y.abs();
+        // If the axis flips, the transformed top-left corner is actually the
+        // rect's right/bottom edge on screen — slide back by the size so
+        // (x, y) stays the min corner.
+        let x = if self.view.scale.x < 0.0 {
+            top_left.x - w
+        } else {
+            top_left.x
+        };
+        let y = if self.view.scale.y < 0.0 {
+            top_left.y - h
+        } else {
+            top_left.y
+        };
+        Rect2 { x, y, w, h }
+    }
+
     /// Filled rectangle.
     pub fn fill_rect(&mut self, rect: Rect2, color: Color) {
         let ls = self.ctx.logical_size;
-        self.ctx
-            .shapes
-            .fill_rect(rect.x, rect.y, rect.w, rect.h, color, ls);
+        let r = self.view_rect(rect);
+        self.ctx.shapes.fill_rect(r.x, r.y, r.w, r.h, color, ls);
         self.ensure_shape_cmd();
     }
 
     /// Rectangle outline.
     pub fn rect_outline(&mut self, rect: Rect2, thickness: f32, color: Color) {
         let ls = self.ctx.logical_size;
+        let r = self.view_rect(rect);
+        let thickness = thickness * self.view.length_scale();
         self.ctx
             .shapes
-            .rect_outline(rect.x, rect.y, rect.w, rect.h, thickness, color, ls);
+            .rect_outline(r.x, r.y, r.w, r.h, thickness, color, ls);
         self.ensure_shape_cmd();
     }
 
     /// Line segment.
     pub fn line(&mut self, from: Point, to: Point, thickness: f32, color: Color) {
         let ls = self.ctx.logical_size;
+        let from = self.view.apply(from);
+        let to = self.view.apply(to);
+        let thickness = thickness * self.view.length_scale();
         self.ctx
             .shapes
             .line(from.x, from.y, to.x, to.y, thickness, color, ls);
@@ -212,6 +295,8 @@ impl<'ctx> Frame<'ctx> {
     /// Filled circle.
     pub fn circle(&mut self, center: Point, radius: f32, color: Color) {
         let ls = self.ctx.logical_size;
+        let center = self.view.apply(center);
+        let radius = radius * self.view.length_scale();
         self.ctx
             .shapes
             .circle(center.x, center.y, radius, color, ls);
@@ -221,6 +306,9 @@ impl<'ctx> Frame<'ctx> {
     /// Circle outline.
     pub fn circle_outline(&mut self, center: Point, radius: f32, thickness: f32, color: Color) {
         let ls = self.ctx.logical_size;
+        let center = self.view.apply(center);
+        let radius = radius * self.view.length_scale();
+        let thickness = thickness * self.view.length_scale();
         self.ctx
             .shapes
             .circle_outline(center.x, center.y, radius, thickness, color, ls);
@@ -230,6 +318,9 @@ impl<'ctx> Frame<'ctx> {
     /// Filled triangle.
     pub fn triangle(&mut self, a: Point, b: Point, c: Point, color: Color) {
         let ls = self.ctx.logical_size;
+        let a = self.view.apply(a);
+        let b = self.view.apply(b);
+        let c = self.view.apply(c);
         self.ctx
             .shapes
             .triangle((a.x, a.y), (b.x, b.y), (c.x, c.y), color, ls);
@@ -240,6 +331,11 @@ impl<'ctx> Frame<'ctx> {
     pub fn text(&mut self, font: FontId, text: &str, pos: Point, style: TextStyle) {
         let ls = self.ctx.logical_size;
         let color = [style.color.r, style.color.g, style.color.b, style.color.a];
+        let pos = self.view.apply(pos);
+        let style = TextStyle {
+            size: style.size * self.view.length_scale(),
+            ..style
+        };
         let Some(renderer) = self.ctx.fonts.get_mut(font.0 as usize) else {
             return;
         };
@@ -354,6 +450,7 @@ impl<'ctx> Frame<'ctx> {
             clear,
             runs,
             cmds,
+            view: _,
         } = self;
         let ls = ctx.logical_size;
 

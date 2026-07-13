@@ -47,15 +47,23 @@ pub enum UniformValue {
 }
 
 impl UniformValue {
-    /// The value's components as little-endian bytes (1–4 f32).
-    fn to_le_bytes(self) -> Vec<u8> {
-        let floats: Vec<f32> = match self {
-            UniformValue::Float(x) => vec![x],
-            UniformValue::Vec2(x, y) => vec![x, y],
-            UniformValue::Vec3(x, y, z) => vec![x, y, z],
-            UniformValue::Vec4(x, y, z, w) => vec![x, y, z, w],
+    /// Encode the occupied component bytes into a stack buffer.
+    ///
+    /// Uniform updates are a hot per-frame path. Returning a fixed buffer plus
+    /// its used length avoids the two heap allocations the former `Vec<f32>`
+    /// -> `Vec<u8>` conversion performed for every update.
+    fn to_le_bytes(self) -> ([u8; 16], usize) {
+        let (components, len) = match self {
+            UniformValue::Float(x) => ([x, 0.0, 0.0, 0.0], 4),
+            UniformValue::Vec2(x, y) => ([x, y, 0.0, 0.0], 8),
+            UniformValue::Vec3(x, y, z) => ([x, y, z, 0.0], 12),
+            UniformValue::Vec4(x, y, z, w) => ([x, y, z, w], 16),
         };
-        floats.iter().flat_map(|f| f.to_le_bytes()).collect()
+        let mut bytes = [0; 16];
+        for (chunk, component) in bytes.chunks_exact_mut(4).zip(components) {
+            chunk.copy_from_slice(&component.to_le_bytes());
+        }
+        (bytes, len)
     }
 }
 
@@ -217,7 +225,8 @@ impl Material {
     /// ignored (the no-panic contract).
     pub(crate) fn set_uniform(&self, queue: &Queue, name: &str, value: UniformValue) {
         if let Some(&offset) = self.offsets.get(name) {
-            queue.write_buffer(&self.uniform_buffer, offset as u64, &value.to_le_bytes());
+            let (bytes, len) = value.to_le_bytes();
+            queue.write_buffer(&self.uniform_buffer, offset as u64, &bytes[..len]);
         }
     }
 
@@ -420,10 +429,7 @@ mod tests {
 
     #[test]
     fn uniform_value_bytes_have_right_length() {
-        assert_eq!(UniformValue::Float(1.0).to_le_bytes().len(), 4);
-        assert_eq!(
-            UniformValue::Vec4(1.0, 2.0, 3.0, 4.0).to_le_bytes().len(),
-            16
-        );
+        assert_eq!(UniformValue::Float(1.0).to_le_bytes().1, 4);
+        assert_eq!(UniformValue::Vec4(1.0, 2.0, 3.0, 4.0).to_le_bytes().1, 16);
     }
 }

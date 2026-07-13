@@ -3,6 +3,8 @@
 //! This is the renderer's answer to cheap 2D primitives — the gap the sprite
 //! and material pipelines do not cover.
 
+use std::sync::LazyLock;
+
 use wgpu::{
     Buffer, BufferAddress, BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites, Device,
     FragmentState, FrontFace, IndexFormat, MultisampleState, PipelineCompilationOptions,
@@ -19,6 +21,15 @@ use crate::sprite::logical_to_clip;
 const VERTEX_STRIDE: BufferAddress = 24;
 /// Triangle-fan segment count for a filled circle.
 const CIRCLE_SEGMENTS: usize = 48;
+
+/// Unit-circle points shared by every circle/ring. Trigonometry is paid once
+/// on first use instead of 96 transcendental calls per primitive per frame.
+static UNIT_CIRCLE: LazyLock<[(f32, f32); CIRCLE_SEGMENTS + 1]> = LazyLock::new(|| {
+    std::array::from_fn(|i| {
+        let angle = (i as f32 / CIRCLE_SEGMENTS as f32) * std::f32::consts::TAU;
+        angle.sin_cos()
+    })
+});
 
 const SHADER: &str = r#"
 struct VertexInput {
@@ -52,6 +63,9 @@ pub(crate) struct ShapeBatch {
     /// CPU-side accumulation for this frame (cleared after upload).
     verts: Vec<f32>,
     indices: Vec<u16>,
+    /// Reused upload scratch; keeps peak geometry capacity across frames.
+    vertex_bytes: Vec<u8>,
+    index_bytes: Vec<u8>,
 }
 
 impl ShapeBatch {
@@ -77,6 +91,8 @@ impl ShapeBatch {
             capacity_verts,
             verts: Vec::new(),
             indices: Vec::new(),
+            vertex_bytes: Vec::new(),
+            index_bytes: Vec::new(),
         }
     }
 
@@ -176,11 +192,9 @@ impl ShapeBatch {
         color: Color,
         logical_size: (u32, u32),
     ) {
-        for i in 0..CIRCLE_SEGMENTS {
-            let a0 = (i as f32 / CIRCLE_SEGMENTS as f32) * std::f32::consts::TAU;
-            let a1 = ((i + 1) as f32 / CIRCLE_SEGMENTS as f32) * std::f32::consts::TAU;
-            let p0 = (cx + a0.cos() * radius, cy + a0.sin() * radius);
-            let p1 = (cx + a1.cos() * radius, cy + a1.sin() * radius);
+        for pair in UNIT_CIRCLE.windows(2) {
+            let p0 = (cx + pair[0].1 * radius, cy + pair[0].0 * radius);
+            let p1 = (cx + pair[1].1 * radius, cy + pair[1].0 * radius);
             self.push_triangle_px((cx, cy), p0, p1, color, logical_size);
         }
     }
@@ -195,13 +209,11 @@ impl ShapeBatch {
         color: Color,
         logical_size: (u32, u32),
     ) {
-        for i in 0..CIRCLE_SEGMENTS {
-            let a0 = (i as f32 / CIRCLE_SEGMENTS as f32) * std::f32::consts::TAU;
-            let a1 = ((i + 1) as f32 / CIRCLE_SEGMENTS as f32) * std::f32::consts::TAU;
-            let x0 = cx + a0.cos() * radius;
-            let y0 = cy + a0.sin() * radius;
-            let x1 = cx + a1.cos() * radius;
-            let y1 = cy + a1.sin() * radius;
+        for pair in UNIT_CIRCLE.windows(2) {
+            let x0 = cx + pair[0].1 * radius;
+            let y0 = cy + pair[0].0 * radius;
+            let x1 = cx + pair[1].1 * radius;
+            let y1 = cy + pair[1].0 * radius;
             self.line(x0, y0, x1, y1, thickness, color, logical_size);
         }
     }
@@ -228,19 +240,32 @@ impl ShapeBatch {
         if vert_count > self.capacity_verts {
             self.grow(device, vert_count);
         }
-        let vbytes: Vec<u8> = self.verts.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let mut ibytes: Vec<u8> = self.indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+        self.vertex_bytes.clear();
+        self.vertex_bytes
+            .reserve(self.verts.len().saturating_mul(std::mem::size_of::<f32>()));
+        for value in &self.verts {
+            self.vertex_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        self.index_bytes.clear();
+        self.index_bytes.reserve(
+            self.indices
+                .len()
+                .saturating_mul(std::mem::size_of::<u16>()),
+        );
+        for index in &self.indices {
+            self.index_bytes.extend_from_slice(&index.to_le_bytes());
+        }
         // `write_buffer` requires the source length to be a multiple of
         // COPY_BUFFER_ALIGNMENT (4). u16 indices are 2 bytes each, so an ODD
         // index count yields a 2-mod-4 length and wgpu rejects the copy. Pad to
         // the next multiple of 4 (the extra bytes sit past `indices.len()`, so
         // draw_indexed never reads them). The index buffer is allocated with the
         // same rounding, so the padded write stays in bounds.
-        while !ibytes.len().is_multiple_of(4) {
-            ibytes.push(0);
+        while !self.index_bytes.len().is_multiple_of(4) {
+            self.index_bytes.push(0);
         }
-        queue.write_buffer(&self.vertex_buffer, 0, &vbytes);
-        queue.write_buffer(&self.index_buffer, 0, &ibytes);
+        queue.write_buffer(&self.vertex_buffer, 0, &self.vertex_bytes);
+        queue.write_buffer(&self.index_buffer, 0, &self.index_bytes);
     }
 
     /// Draw the uploaded shapes.

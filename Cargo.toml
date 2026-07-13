@@ -1,6 +1,6 @@
 [package]
 name = "vk2d"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Standalone immediate-mode 2D renderer on wgpu/Vulkan with WGSL shaders."

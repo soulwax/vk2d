@@ -17,8 +17,8 @@ use wgpu::{
     TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 
-use crate::Vk2dError;
 use crate::blend::BlendMode;
+use crate::{TargetId, TextureId, Vk2dError};
 
 /// The kind of a named uniform, used to compute its size and byte offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,8 +111,17 @@ pub(crate) fn uniform_offsets(uniforms: &[(&str, UniformType)]) -> HashMap<Strin
 /// texture slots. Owned copies (not references) so the material can rebuild
 /// its bind group at any time without borrowing the texture registry.
 struct BoundTexture {
+    source: TextureSource,
     view: TextureView,
     sampler: Sampler,
+}
+
+/// Stable registry identity for an already-bound texture resource. wgpu
+/// handles do not expose value equality, while vk2d's opaque ids do.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextureSource {
+    Texture(TextureId),
+    Target(TargetId),
 }
 
 /// A compiled material: its pipeline, uniform buffer, name->offset map, and
@@ -238,6 +247,7 @@ impl Material {
         &mut self,
         device: &Device,
         name: &str,
+        source: TextureSource,
         view: TextureView,
         sampler: Sampler,
         fallback: (&TextureView, &Sampler),
@@ -245,7 +255,17 @@ impl Material {
         let Some(slot) = self.texture_names.iter().position(|n| n == name) else {
             return;
         };
-        self.bound_textures[slot] = Some(BoundTexture { view, sampler });
+        if self.bound_textures[slot]
+            .as_ref()
+            .is_some_and(|bound| bound.source == source)
+        {
+            return;
+        }
+        self.bound_textures[slot] = Some(BoundTexture {
+            source,
+            view,
+            sampler,
+        });
         self.bind_group = build_bind_group(
             device,
             &self.bind_group_layout,

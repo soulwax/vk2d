@@ -11,7 +11,7 @@ use wgpu::{
 use winit::window::Window;
 
 use crate::frame::FrameScratch;
-use crate::material::{Material, MaterialDesc, create_fallback_texture};
+use crate::material::{Material, MaterialDesc, TextureSource, create_fallback_texture};
 use crate::sprite::{Filter, GpuTexture, SpriteBatch, create_gpu_texture};
 use crate::target::{SCENE_FORMAT, SceneTarget};
 use crate::text::TextRenderer;
@@ -310,7 +310,14 @@ impl Context {
             .get_or_insert_with(|| create_fallback_texture(&self.device, &self.queue));
         let fallback = (&fallback.0, &fallback.1);
         if let Some(mat) = self.materials.get_mut(material.0 as usize) {
-            mat.set_texture(&self.device, name, view, sampler, fallback);
+            mat.set_texture(
+                &self.device,
+                name,
+                TextureSource::Texture(texture),
+                view,
+                sampler,
+                fallback,
+            );
         }
     }
 
@@ -338,7 +345,14 @@ impl Context {
             .get_or_insert_with(|| create_fallback_texture(&self.device, &self.queue));
         let fallback = (&fallback.0, &fallback.1);
         if let Some(mat) = self.materials.get_mut(material.0 as usize) {
-            mat.set_texture(&self.device, name, view, sampler, fallback);
+            mat.set_texture(
+                &self.device,
+                name,
+                TextureSource::Target(target),
+                view,
+                sampler,
+                fallback,
+            );
         }
     }
 

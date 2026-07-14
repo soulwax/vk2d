@@ -9,7 +9,7 @@ use wgpu::{
     AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
     BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource, BindingType, Buffer,
     BufferBindingType, BufferDescriptor, BufferUsages, ColorTargetState, ColorWrites, Device,
-    Extent3d, FilterMode, FragmentState, MultisampleState, PipelineCompilationOptions,
+    Extent3d, FilterMode, FragmentState, FrontFace, MultisampleState, PipelineCompilationOptions,
     PipelineLayoutDescriptor, PrimitiveState, PrimitiveTopology, Queue, RenderPipeline,
     RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor,
     ShaderModuleDescriptor, ShaderSource, ShaderStages, TextureAspect, TextureDescriptor,
@@ -18,7 +18,58 @@ use wgpu::{
 };
 
 use crate::blend::BlendMode;
+use crate::sprite::sprite_vertex_buffer_layout;
 use crate::{TargetId, TextureId, Vk2dError};
+
+/// The sprite-shaded vertex stage vk2d appends to a material's WGSL before
+/// building its sprite-shaded pipeline (see [`Material::sprite_pipeline`]). It
+/// consumes the exact per-vertex layout `sprite.rs` produces
+/// ([`crate::sprite::sprite_vertex_buffer_layout`]): position/uv/tint at
+/// locations 0/1/2. The position arrives already in clip space (the record path
+/// converts logical pixels → clip against the render target's own size); this
+/// stage forwards uv/tint to the material's `fs_main` at
+/// `@location(0)`/`@location(1)`.
+///
+/// Clip-space Y note: `sprite.rs`'s plain vertex stage is compiled from WGSL
+/// (`ShaderSource::Wgsl`) and passes the clip position through unchanged. This
+/// stage, however, is part of a material module compiled to SPIR-V through
+/// [`compile_wgsl_to_spirv`], whose naga options set `ADJUST_COORDINATE_SPACE`
+/// (a clip-Y negation the game's fullscreen materials depend on). To land the
+/// SAME on-screen pixels as the plain sprite path, this stage PRE-NEGATES Y so
+/// the adjustment cancels it back to `sprite.rs`'s convention — without that,
+/// a `material_sprite` renders vertically mirrored relative to `sprite()`. The
+/// global compile flag is left untouched so existing fullscreen materials stay
+/// correct; the compensation is local to the sprite path only.
+///
+/// A sprite-shaded material's `fs_main` therefore receives an interpolated
+/// `@location(0) uv: vec2<f32>` and `@location(1) tint: vec4<f32>`; it samples
+/// the sprite's texture (bound into the material's texture slot 0,
+/// `@binding(1)`/`@binding(2)`) at `uv` and controls the final pixel colour. The
+/// entry point is name-spaced (`vk2d_sprite_vs_main`) so it never collides with
+/// the author's own `vs_main` (the fullscreen pipeline's vertex stage), letting
+/// ONE compiled module back BOTH pipelines.
+const SPRITE_VS: &str = r#"
+struct Vk2dSpriteVsIn {
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) tint: vec4<f32>,
+};
+struct Vk2dSpriteVsOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) tint: vec4<f32>,
+};
+@vertex
+fn vk2d_sprite_vs_main(in: Vk2dSpriteVsIn) -> Vk2dSpriteVsOut {
+    var out: Vk2dSpriteVsOut;
+    // Pre-negate Y so the material module's ADJUST_COORDINATE_SPACE flip cancels
+    // it, matching sprite.rs's (WGSL, un-adjusted) clip convention.
+    out.position = vec4<f32>(in.position.x, -in.position.y, 0.0, 1.0);
+    out.uv = in.uv;
+    out.tint = in.tint;
+    return out;
+}
+"#;
 
 /// The kind of a named uniform, used to compute its size and byte offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +178,18 @@ pub(crate) enum TextureSource {
 /// A compiled material: its pipeline, uniform buffer, name->offset map, and
 /// (if it declares any) its texture slots.
 pub(crate) struct Material {
-    pub pipeline: RenderPipeline,
+    /// The fullscreen pipeline (author's `vs_main` + `fs_main`), built lazily
+    /// the first time [`crate::Frame::material_fullscreen`] records this
+    /// material. Deferred because a material authored ONLY for
+    /// [`crate::Frame::material_sprite`] gives its `fs_main` the sprite vertex
+    /// stage's `@location(0) uv`/`@location(1) tint` inputs, which the bufferless
+    /// fullscreen `vs_main` (bare `@builtin(position)`) cannot provide — building
+    /// the fullscreen pipeline eagerly would fail wgpu's stage-matching for such
+    /// a material even though it is never drawn fullscreen. The WGSL is still
+    /// compiled to SPIR-V at load (syntax/validation errors surface there); only
+    /// this pipeline object's construction — and its per-pipeline stage linking —
+    /// waits for first fullscreen use. Symmetric with `sprite_pipeline`.
+    pipeline: Option<RenderPipeline>,
     pub bind_group: BindGroup,
     pub uniform_buffer: Buffer,
     pub offsets: HashMap<String, u32>,
@@ -141,6 +203,22 @@ pub(crate) struct Material {
     /// until the app calls `set_texture`; the fallback is substituted when
     /// rebuilding the bind group.
     bound_textures: Vec<Option<BoundTexture>>,
+    /// The compiled shader module backing BOTH pipelines. It carries the
+    /// author's `vs_main`/`fs_main` AND the appended sprite vertex stage
+    /// (`vk2d_sprite_vs_main`, see [`SPRITE_VS`]), so the sprite-shaded pipeline
+    /// can be built from it on demand without recompiling.
+    module: wgpu::ShaderModule,
+    /// The scene format both pipelines render into — kept so the sprite-shaded
+    /// pipeline can be built lazily with the same target as the fullscreen one.
+    target_format: TextureFormat,
+    /// The material's blend mode — reused by the sprite-shaded pipeline so a
+    /// material composites identically whichever draw verb records it.
+    blend: BlendMode,
+    /// The sprite-shaded pipeline (the sprite vertex stage + this material's
+    /// `fs_main`), built lazily the first time [`crate::Frame::material_sprite`]
+    /// records this material — zero cost for materials only ever drawn
+    /// fullscreen. See [`Material::sprite_pipeline`].
+    sprite_pipeline: Option<RenderPipeline>,
 }
 
 impl Material {
@@ -153,10 +231,16 @@ impl Material {
         target_format: TextureFormat,
         fallback: (&TextureView, &Sampler),
     ) -> Result<Self, Vk2dError> {
-        let source = match desc.prelude {
-            Some(prelude) => std::borrow::Cow::Owned(format!("{prelude}\n{}", desc.wgsl)),
-            None => std::borrow::Cow::Borrowed(desc.wgsl),
+        // Append the sprite vertex stage so ONE compiled module backs both the
+        // fullscreen pipeline (author's `vs_main`) and the sprite-shaded
+        // pipeline (`vk2d_sprite_vs_main` + author's `fs_main`). A material that
+        // is only ever drawn fullscreen still carries the extra (dead) vertex
+        // entry point; it is a handful of instructions and never dispatched.
+        let author = match desc.prelude {
+            Some(prelude) => format!("{prelude}\n{}", desc.wgsl),
+            None => desc.wgsl.to_string(),
         };
+        let source = format!("{author}\n{SPRITE_VS}");
         let spirv = compile_wgsl_to_spirv(&source)?;
         let module = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("vk2d.material.shader"),
@@ -184,50 +268,155 @@ impl Material {
             fallback,
         );
 
-        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: Some("vk2d.material.pipeline_layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("vk2d.material.pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: VertexState {
-                module: &module,
-                entry_point: Some("vs_main"),
-                compilation_options: PipelineCompilationOptions::default(),
-                buffers: &[],
-            },
-            primitive: PrimitiveState {
-                topology: PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: MultisampleState::default(),
-            fragment: Some(FragmentState {
-                module: &module,
-                entry_point: Some("fs_main"),
-                compilation_options: PipelineCompilationOptions::default(),
-                targets: &[Some(ColorTargetState {
-                    format: target_format,
-                    blend: desc.blend.blend_state(),
-                    write_mask: ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
         Ok(Self {
-            pipeline,
+            pipeline: None,
             bind_group,
             uniform_buffer,
             offsets,
             texture_names,
             bind_group_layout,
             bound_textures,
+            module,
+            target_format,
+            blend: desc.blend,
+            sprite_pipeline: None,
         })
+    }
+
+    /// The fullscreen pipeline (author's `vs_main` + `fs_main`, no vertex
+    /// buffer), built on first use and cached thereafter. See the `pipeline`
+    /// field for why it is lazy. Returns the built pipeline for the draw pass to
+    /// bind.
+    pub(crate) fn fullscreen_pipeline(&mut self, device: &Device) -> &RenderPipeline {
+        if self.pipeline.is_none() {
+            let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: Some("vk2d.material.pipeline_layout"),
+                bind_group_layouts: &[Some(&self.bind_group_layout)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("vk2d.material.pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: VertexState {
+                    module: &self.module,
+                    entry_point: Some("vs_main"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                fragment: Some(FragmentState {
+                    module: &self.module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    targets: &[Some(ColorTargetState {
+                        format: self.target_format,
+                        blend: self.blend.blend_state(),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.pipeline = Some(pipeline);
+        }
+        self.pipeline.as_ref().expect("just built above")
+    }
+
+    /// The already-built fullscreen pipeline, or `None` if it has not been built
+    /// yet — the read-only accessor the draw pass uses (it holds `&Context` and
+    /// cannot call the `&mut` [`Self::fullscreen_pipeline`] builder). The
+    /// pre-warm phase builds it first for any material with a `material_fullscreen`
+    /// command this frame.
+    pub(crate) fn fullscreen_pipeline_cached(&self) -> Option<&RenderPipeline> {
+        self.pipeline.as_ref()
+    }
+
+    /// The sprite-shaded pipeline for this material, built on first use and
+    /// cached thereafter (binding-layout Option (b): a lazy per-material
+    /// variant, so a material only ever drawn fullscreen never pays for it).
+    ///
+    /// It pairs `sprite.rs`'s vertex layout + the appended `vk2d_sprite_vs_main`
+    /// vertex stage with this material's own `fs_main`, and reuses the
+    /// material's EXISTING bind-group layout unchanged — the sprite's texture is
+    /// bound into the material's texture slot 0 (`@binding(1)`/`@binding(2)`)
+    /// through the ordinary [`Material::set_texture`] path, so no extra layout
+    /// entry is needed. The vertex buffer layout comes from the shared
+    /// [`sprite_vertex_buffer_layout`], guaranteeing a byte-exact match with the
+    /// plain sprite pipeline (a stride/offset drift would feed the vertex stage
+    /// garbage with no compile error).
+    ///
+    /// Returns `None` if the material declares no texture slot — a sprite-shaded
+    /// material must have at least slot 0 for the sprite's source texture; the
+    /// caller ([`crate::Frame::material_sprite`]) treats that as a no-op.
+    pub(crate) fn sprite_pipeline(&mut self, device: &Device) -> Option<&RenderPipeline> {
+        if self.texture_names.is_empty() {
+            return None;
+        }
+        if self.sprite_pipeline.is_none() {
+            let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: Some("vk2d.material.sprite_pipeline_layout"),
+                bind_group_layouts: &[Some(&self.bind_group_layout)],
+                immediate_size: 0,
+            });
+            let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("vk2d.material.sprite_pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: VertexState {
+                    module: &self.module,
+                    entry_point: Some("vk2d_sprite_vs_main"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    buffers: &[sprite_vertex_buffer_layout()],
+                },
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+                    // The sprite batch emits CCW quads (see `sprite.rs`); match
+                    // its winding and cull nothing, exactly like the plain
+                    // sprite pipeline, so a material-shaded sprite rasterizes
+                    // identically.
+                    front_face: FrontFace::Ccw,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                fragment: Some(FragmentState {
+                    module: &self.module,
+                    entry_point: Some("fs_main"),
+                    compilation_options: PipelineCompilationOptions::default(),
+                    targets: &[Some(ColorTargetState {
+                        format: self.target_format,
+                        blend: self.blend.blend_state(),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            self.sprite_pipeline = Some(pipeline);
+        }
+        self.sprite_pipeline.as_ref()
+    }
+
+    /// The already-built sprite-shaded pipeline, or `None` if it has not been
+    /// built yet. A read-only accessor for the draw pass (which holds `&Context`
+    /// and cannot call the `&mut` [`Self::sprite_pipeline`] builder); the
+    /// pre-warm phase builds it first, so this returns `Some` for any material
+    /// that had a `material_sprite` run this frame.
+    pub(crate) fn sprite_pipeline_cached(&self) -> Option<&RenderPipeline> {
+        self.sprite_pipeline.as_ref()
+    }
+
+    /// Whether this material declares at least one texture slot — the
+    /// prerequisite for [`crate::Frame::material_sprite`], whose sprite source
+    /// binds into slot 0. A uniform-only material returns `false` and
+    /// `material_sprite` no-ops.
+    pub(crate) fn has_texture_slot(&self) -> bool {
+        !self.texture_names.is_empty()
     }
 
     /// Write a named uniform's value at its mapped offset. Unknown names are
@@ -237,6 +426,52 @@ impl Material {
             let (bytes, len) = value.to_le_bytes();
             queue.write_buffer(&self.uniform_buffer, offset as u64, &bytes[..len]);
         }
+    }
+
+    /// Build a fresh bind group for a single [`crate::Frame::material_sprite`]
+    /// run: this material's uniform buffer, the sprite's `view`/`sampler` in
+    /// texture slot 0 (`@binding(1)`/`@binding(2)`), and the shared `fallback`
+    /// in every other declared slot. Unlike [`Self::set_texture`], this does NOT
+    /// mutate the material's persistent `bound_textures`/`bind_group` — each
+    /// material-sprite run gets its own bind group, so two runs that draw
+    /// different textures through the SAME material in one frame stay correct
+    /// (a single shared bind group would leave only the last texture bound).
+    pub(crate) fn build_sprite_bind_group(
+        &self,
+        device: &Device,
+        view: &TextureView,
+        sampler: &Sampler,
+        fallback: (&TextureView, &Sampler),
+    ) -> BindGroup {
+        let (fallback_view, fallback_sampler) = fallback;
+        let mut entries = Vec::with_capacity(1 + self.texture_names.len() * 2);
+        entries.push(BindGroupEntry {
+            binding: 0,
+            resource: self.uniform_buffer.as_entire_binding(),
+        });
+        for i in 0..self.texture_names.len() {
+            // Slot 0 gets the sprite's source; any further declared slots fall
+            // back to the shared 1x1 white (a sprite-shaded material typically
+            // declares only slot 0, but extra slots must still be populated).
+            let (v, s) = if i == 0 {
+                (view, sampler)
+            } else {
+                (fallback_view, fallback_sampler)
+            };
+            entries.push(BindGroupEntry {
+                binding: 1 + 2 * i as u32,
+                resource: BindingResource::TextureView(v),
+            });
+            entries.push(BindGroupEntry {
+                binding: 2 + 2 * i as u32,
+                resource: BindingResource::Sampler(s),
+            });
+        }
+        device.create_bind_group(&BindGroupDescriptor {
+            label: Some("vk2d.material.sprite_bind_group"),
+            layout: &self.bind_group_layout,
+            entries: &entries,
+        })
     }
 
     /// Bind `view`/`sampler` to the declared texture slot named `name` and
@@ -423,6 +658,14 @@ pub fn compile_wgsl_to_spirv(wgsl: &str) -> Result<Vec<u32>, Vk2dError> {
     .map_err(|e| Vk2dError::ShaderCompile {
         message: format!("{e:?}"),
     })?;
+    // NOTE on clip-space Y: naga's default SPIR-V options set
+    // `ADJUST_COORDINATE_SPACE`, which flips clip-space Y. Every EXISTING vk2d
+    // material (the game's fullscreen post/effect shaders) was authored against
+    // that convention — they emit their own `out.uv = (p.x, 1 - p.y)` and rely
+    // on the adjustment — so this flag MUST stay set or every shipping
+    // fullscreen material would render vertically mirrored. The sprite-shaded
+    // path instead compensates inside its injected vertex stage (see
+    // `SPRITE_VS`), keeping this global compile untouched.
     let spv =
         naga::back::spv::write_vec(&module, &info, &naga::back::spv::Options::default(), None)
             .map_err(|e| Vk2dError::ShaderCompile {
@@ -451,5 +694,87 @@ mod tests {
     fn uniform_value_bytes_have_right_length() {
         assert_eq!(UniformValue::Float(1.0).to_le_bytes().1, 4);
         assert_eq!(UniformValue::Vec4(1.0, 2.0, 3.0, 4.0).to_le_bytes().1, 16);
+    }
+
+    /// A sprite-shaded material's `fs_main` consumes the interpolated
+    /// `@location(0) uv` / `@location(1) tint` the appended sprite vertex stage
+    /// produces. The material source concatenated with `SPRITE_VS` (the exact
+    /// concatenation `Material::new` performs before compiling) must compile:
+    /// the two vertex entry points (`vs_main` + `vk2d_sprite_vs_main`) coexist
+    /// in one module, and `fs_main`'s inputs line up with the sprite stage's
+    /// outputs by `@location`. This is the compile-side half of the pipeline
+    /// construction invariant — the live GPU pipeline build is exercised by the
+    /// `material_sprite_pipeline` integration test.
+    #[test]
+    fn sprite_shaded_material_source_compiles_with_appended_vertex_stage() {
+        // A representative sprite-shaded material: a uniform block, one texture
+        // slot (slot 0 = the sprite source), a fullscreen `vs_main`, and an
+        // `fs_main` that samples slot 0 at the interpolated uv and multiplies by
+        // both the vertex tint and a uniform — the passthrough-tint shape.
+        const SPRITE_MAT: &str = r#"
+struct U { tint: vec4<f32> };
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var t0: texture_2d<f32>;
+@group(0) @binding(2) var s0: sampler;
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4<f32>(uv * 2.0 - vec2<f32>(1.0, 1.0), 0.0, 1.0);
+}
+struct FsIn {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) tint: vec4<f32>,
+};
+@fragment fn fs_main(in: FsIn) -> @location(0) vec4<f32> {
+    return textureSample(t0, s0, in.uv) * in.tint * u.tint;
+}
+"#;
+        let combined = format!("{SPRITE_MAT}\n{SPRITE_VS}");
+        assert!(
+            compile_wgsl_to_spirv(&combined).is_ok(),
+            "sprite-shaded material + appended vertex stage must compile"
+        );
+        // And the appended stage alone is well-formed WGSL (guards a typo in
+        // SPRITE_VS from only surfacing once spliced into a full material).
+        assert!(
+            compile_wgsl_to_spirv(&format!(
+                "@fragment fn fs_main() -> @location(0) vec4<f32> {{ return vec4<f32>(1.0); }}\n{SPRITE_VS}"
+            ))
+            .is_ok(),
+            "the appended sprite vertex stage must be valid WGSL"
+        );
+    }
+
+    /// The load-bearing invariant: the vertex buffer layout the material
+    /// sprite-shaded pipeline builds from is byte-for-byte the one `sprite.rs`'s
+    /// plain sprite pipeline uses. A silent stride/offset drift would feed the
+    /// material's vertex stage garbage with no compile error, so pin the shared
+    /// layout's stride and every attribute's offset/format/location here.
+    #[test]
+    fn sprite_shaded_pipeline_uses_the_exact_sprite_vertex_layout() {
+        use crate::sprite::{SPRITE_VERTEX_ATTRIBUTES, VERTEX_STRIDE, sprite_vertex_buffer_layout};
+
+        let layout = sprite_vertex_buffer_layout();
+        // Stride: position(8) + uv(8) + tint(16) = 32 bytes.
+        assert_eq!(layout.array_stride, VERTEX_STRIDE);
+        assert_eq!(layout.array_stride, 32);
+        assert_eq!(layout.step_mode, wgpu::VertexStepMode::Vertex);
+        // The layout draws its attributes from the single shared source of
+        // truth, so the material pipeline (which also builds from it) cannot
+        // drift from the sprite pipeline.
+        assert_eq!(layout.attributes, &SPRITE_VERTEX_ATTRIBUTES);
+
+        // Explicit offsets/formats/locations — position @0, uv @8, tint @16.
+        let expect = [
+            (wgpu::VertexFormat::Float32x2, 0u64, 0u32),
+            (wgpu::VertexFormat::Float32x2, 8, 1),
+            (wgpu::VertexFormat::Float32x4, 16, 2),
+        ];
+        assert_eq!(SPRITE_VERTEX_ATTRIBUTES.len(), expect.len());
+        for (attr, (format, offset, location)) in SPRITE_VERTEX_ATTRIBUTES.iter().zip(expect) {
+            assert_eq!(attr.format, format);
+            assert_eq!(attr.offset, offset);
+            assert_eq!(attr.shader_location, location);
+        }
     }
 }

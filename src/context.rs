@@ -263,10 +263,17 @@ impl Context {
     }
 
     /// Compile a WGSL material and register it. The WGSL is compiled to SPIR-V
-    /// now (at load), so a shader error is returned here — not at first draw.
-    /// Materials render into the scene target (scene format). Any declared
-    /// [`MaterialDesc::textures`] slot starts bound to the shared 1x1 white
-    /// fallback until [`Context::set_material_texture`] binds a real texture.
+    /// now (at load), so a WGSL syntax/validation error is returned here — not
+    /// at first draw. The render pipelines themselves are built lazily on first
+    /// use (fullscreen on first [`crate::Frame::material_fullscreen`], sprite on
+    /// first [`crate::Frame::material_sprite`]); this lets a material intended
+    /// only for `material_sprite` — whose `fs_main` takes the sprite vertex
+    /// stage's uv/tint inputs, which the bufferless fullscreen `vs_main` cannot
+    /// supply — register without a pipeline-stage-match failure it would never
+    /// hit in practice. Materials render into the scene target (scene format).
+    /// Any declared [`MaterialDesc::textures`] slot starts bound to the shared
+    /// 1x1 white fallback until [`Context::set_material_texture`] binds a real
+    /// texture.
     pub fn load_material(&mut self, desc: MaterialDesc) -> Result<MaterialId, Vk2dError> {
         self.fallback_texture();
         let fallback = self
@@ -426,6 +433,45 @@ impl Context {
         self.target_sprite_bind_groups[index]
             .as_ref()
             .expect("just inserted above")
+    }
+
+    /// Prepare one [`crate::Frame::material_sprite`] run: ensure `material`'s
+    /// sprite-shaded pipeline is built (lazily, on first use) and build a fresh
+    /// bind group binding `texture` into the material's slot 0. Returns the
+    /// owned bind group, or `None` if the material or texture id is unknown or
+    /// the material declares no texture slot (all no-ops the draw skips).
+    ///
+    /// Called from `Frame::render_scene`'s pre-warm phase — BEFORE the scene
+    /// pass borrows `ctx` immutably — because both the pipeline build and the
+    /// fallback-texture lazy-init need `&mut self`. The returned bind group is a
+    /// standalone owned resource (it borrows the device/layout only at
+    /// creation), so it can be held and bound during the immutable pass.
+    pub(crate) fn prepare_material_sprite(
+        &mut self,
+        material: MaterialId,
+        texture: TextureId,
+    ) -> Option<wgpu::BindGroup> {
+        // The material must exist and declare a texture slot for the sprite.
+        let mat = self.materials.get(material.0 as usize)?;
+        if !mat.has_texture_slot() {
+            return None;
+        }
+        let gpu = self.textures.get(texture.0 as usize)?;
+        // Cheap ref-counted clones (see `set_material_texture`): no GPU-memory
+        // duplication.
+        let view = gpu.view.clone();
+        let sampler = gpu.sampler.clone();
+        // Build the sprite-shaded pipeline (lazy, cached on the material).
+        self.materials
+            .get_mut(material.0 as usize)?
+            .sprite_pipeline(&self.device)?;
+        // Ensure the shared fallback exists, then build this run's bind group.
+        let fallback = self
+            .fallback_texture
+            .get_or_insert_with(|| create_fallback_texture(&self.device, &self.queue));
+        let fallback = (&fallback.0, &fallback.1);
+        let mat = self.materials.get(material.0 as usize)?;
+        Some(mat.build_sprite_bind_group(&self.device, &view, &sampler, fallback))
     }
 
     /// A human-readable description of the selected adapter (name, backend,

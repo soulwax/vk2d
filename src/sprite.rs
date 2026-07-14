@@ -41,9 +41,46 @@ impl Filter {
 }
 
 /// Bytes per vertex: position (2×f32) + uv (2×f32) + tint (4×f32).
-const VERTEX_STRIDE: BufferAddress = 32;
+pub(crate) const VERTEX_STRIDE: BufferAddress = 32;
 const VERTS_PER_SPRITE: usize = 4;
 const INDICES_PER_SPRITE: usize = 6;
+
+/// The per-vertex attribute layout shared by EVERY sprite draw path: the plain
+/// sprite pipeline ([`create_pipeline`]) and the material sprite-shaded pipeline
+/// (`crate::material`). Position at offset 0, uv at 8, tint at 16 — one
+/// authoritative definition so the two pipelines can never drift apart. A silent
+/// stride/offset mismatch between them would feed the material's vertex stage
+/// garbage without any compile error, so both must build their vertex state from
+/// exactly this.
+pub(crate) const SPRITE_VERTEX_ATTRIBUTES: [VertexAttribute; 3] = [
+    VertexAttribute {
+        format: VertexFormat::Float32x2,
+        offset: 0,
+        shader_location: 0,
+    },
+    VertexAttribute {
+        format: VertexFormat::Float32x2,
+        offset: 8,
+        shader_location: 1,
+    },
+    VertexAttribute {
+        format: VertexFormat::Float32x4,
+        offset: 16,
+        shader_location: 2,
+    },
+];
+
+/// The [`VertexBufferLayout`] every sprite-format pipeline binds: `VERTEX_STRIDE`
+/// bytes per vertex, per-vertex stepping, and [`SPRITE_VERTEX_ATTRIBUTES`]. The
+/// single source of truth behind both the plain sprite pipeline and the material
+/// sprite-shaded pipeline — see [`SPRITE_VERTEX_ATTRIBUTES`].
+pub(crate) fn sprite_vertex_buffer_layout() -> VertexBufferLayout<'static> {
+    VertexBufferLayout {
+        array_stride: VERTEX_STRIDE,
+        step_mode: VertexStepMode::Vertex,
+        attributes: &SPRITE_VERTEX_ATTRIBUTES,
+    }
+}
 
 /// What a sprite run samples: an uploaded texture, or a finished render
 /// target's own color output (the `target_sprite` path — drawing a prior
@@ -251,10 +288,29 @@ impl SpriteBatch {
         run: SpriteRun,
         bind_group: &'pass BindGroup,
     ) {
+        self.draw_run_with_pipeline(pass, run, &self.pipeline, bind_group);
+    }
+
+    /// Draw one staged run against an EXPLICIT pipeline + bind group, reusing
+    /// this batch's staged vertex/index buffers. The material sprite-shaded
+    /// path ([`crate::Frame::material_sprite`]) uses this to draw the same
+    /// sprite geometry through a material's own pipeline (the material's
+    /// fragment stage) and bind group (its uniforms + the sprite's texture in
+    /// slot 0). The vertex buffer layout the caller's pipeline was built with
+    /// MUST match [`sprite_vertex_buffer_layout`] — the invariant a
+    /// stride/offset drift would silently violate — which the material pipeline
+    /// guarantees by building from that same helper.
+    pub(crate) fn draw_run_with_pipeline<'pass>(
+        &'pass self,
+        pass: &mut RenderPass<'pass>,
+        run: SpriteRun,
+        pipeline: &'pass RenderPipeline,
+        bind_group: &'pass BindGroup,
+    ) {
         if run.index_count == 0 {
             return;
         }
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint16);
@@ -473,27 +529,7 @@ fn create_pipeline(
             module: &shader,
             entry_point: Some("vs_main"),
             compilation_options: PipelineCompilationOptions::default(),
-            buffers: &[VertexBufferLayout {
-                array_stride: VERTEX_STRIDE,
-                step_mode: VertexStepMode::Vertex,
-                attributes: &[
-                    VertexAttribute {
-                        format: VertexFormat::Float32x2,
-                        offset: 0,
-                        shader_location: 0,
-                    },
-                    VertexAttribute {
-                        format: VertexFormat::Float32x2,
-                        offset: 8,
-                        shader_location: 1,
-                    },
-                    VertexAttribute {
-                        format: VertexFormat::Float32x4,
-                        offset: 16,
-                        shader_location: 2,
-                    },
-                ],
-            }],
+            buffers: &[sprite_vertex_buffer_layout()],
         },
         primitive: PrimitiveState {
             topology: PrimitiveTopology::TriangleList,

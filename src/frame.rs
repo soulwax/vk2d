@@ -28,6 +28,13 @@ enum DrawCmd {
     /// is either an uploaded texture ([`Frame::sprite`]) or a finished render
     /// target's own color output ([`Frame::target_sprite`]).
     Sprites(SpriteSource, usize),
+    /// A material sprite run ([`Frame::material_sprite`]): the same sprite
+    /// geometry as [`DrawCmd::Sprites`], drawn through `material`'s pipeline
+    /// (its `fs_main`) with the run's texture bound into the material's slot 0.
+    /// Keyed on BOTH the material AND the texture, so switching either one
+    /// starts a new run (a run's single texture is what gets bound into the
+    /// material for that draw). `run_slot` indexes the same `runs` list.
+    MaterialSprites(MaterialId, TextureId, usize),
     /// The shape batch (all accumulated shapes; drawn once).
     Shapes,
     /// A material drawn fullscreen into the scene.
@@ -287,6 +294,47 @@ impl<'ctx> Frame<'ctx> {
         self.push_sprite_instance(SpriteSource::Target(target), (w as f32, h as f32), instance);
     }
 
+    /// Draw `texture` at `pos` (top-left) with `params`, shaded by `material`'s
+    /// WGSL fragment stage instead of the default textured sprite pipeline. The
+    /// sprite geometry (position/uv/tint per vertex, transformed by the current
+    /// [`View2`] and converted to clip against the render target's own size) is
+    /// produced exactly like [`Frame::sprite`]; only the fragment stage differs
+    /// — the material author's `fs_main` controls the pixel colour.
+    ///
+    /// `texture` is bound into the material's texture slot 0
+    /// (`@binding(1)`/`@binding(2)`), so the material's `fs_main` samples it with
+    /// the interpolated `@location(0) uv` and multiplies by the vertex
+    /// `@location(1) tint` (`params.tint`). A sprite-shaded material must declare
+    /// at least one texture slot; a material with none (or an unknown material /
+    /// texture id) is a no-op (no panic).
+    ///
+    /// Signature mirrors [`Frame::sprite`] with one leading `material`.
+    pub fn material_sprite(
+        &mut self,
+        material: MaterialId,
+        texture: TextureId,
+        pos: Point,
+        params: SpriteParams,
+    ) {
+        // Unknown material, a material with no texture slot for the sprite
+        // source, or an unknown texture: no-op (mirrors `sprite`'s guard).
+        let has_slot = self
+            .ctx
+            .materials
+            .get(material.0 as usize)
+            .is_some_and(|m| m.has_texture_slot());
+        if !has_slot {
+            return;
+        }
+        let Some(tex) = self.ctx.textures.get(texture.0 as usize) else {
+            return;
+        };
+        let whole_source = [0.0, 0.0, tex.width, tex.height];
+        let atlas_size = (tex.width, tex.height);
+        let instance = self.build_sprite_instance(pos, params, whole_source);
+        self.push_material_sprite_instance(material, texture, atlas_size, instance);
+    }
+
     /// Build a [`SpriteInstance`] from `pos` (top-left) + `params`, applying
     /// the current [`View2`] exactly like [`Frame::sprite`] — shared by
     /// `sprite` and `target_sprite` so a target-as-texture blit transforms
@@ -358,8 +406,52 @@ impl<'ctx> Frame<'ctx> {
         atlas_size: (f32, f32),
         instance: SpriteInstance,
     ) {
-        if let Some(DrawCmd::Sprites(s, slot)) = self.cmds.last()
-            && *s == source
+        let can_extend = matches!(self.cmds.last(), Some(DrawCmd::Sprites(s, _)) if *s == source);
+        self.push_instance_run(can_extend, atlas_size, instance, |slot| {
+            DrawCmd::Sprites(source, slot)
+        });
+    }
+
+    /// Append `instance` to a sprite run drawn through `material`'s pipeline
+    /// with `texture` bound into the material's slot 0
+    /// ([`Frame::material_sprite`]). Extends the current run only when the last
+    /// draw was the SAME material AND texture (a run binds exactly one texture
+    /// into the material, so a different texture — or material — must open a new
+    /// run). Reuses the shared instance-building/run-batching path so the
+    /// geometry is produced identically to an ordinary sprite.
+    fn push_material_sprite_instance(
+        &mut self,
+        material: MaterialId,
+        texture: TextureId,
+        atlas_size: (f32, f32),
+        instance: SpriteInstance,
+    ) {
+        let can_extend = matches!(
+            self.cmds.last(),
+            Some(DrawCmd::MaterialSprites(m, t, _)) if *m == material && *t == texture
+        );
+        self.push_instance_run(can_extend, atlas_size, instance, |slot| {
+            DrawCmd::MaterialSprites(material, texture, slot)
+        });
+    }
+
+    /// The shared run-batching core behind [`Self::push_sprite_instance`] and
+    /// [`Self::push_material_sprite_instance`]: if `can_extend` (the caller's
+    /// key matched the last command), push `instance` onto that command's run;
+    /// otherwise open a new run (recycling a spare instance vector) and record
+    /// the command `make_cmd(slot)` produces. Keeping the run/slot/spare
+    /// bookkeeping in one place means the two draw verbs can never diverge in
+    /// how they allocate or extend runs.
+    fn push_instance_run(
+        &mut self,
+        can_extend: bool,
+        atlas_size: (f32, f32),
+        instance: SpriteInstance,
+        make_cmd: impl FnOnce(usize) -> DrawCmd,
+    ) {
+        if can_extend
+            && let Some(DrawCmd::Sprites(_, slot) | DrawCmd::MaterialSprites(_, _, slot)) =
+                self.cmds.last()
         {
             self.runs[*slot].instances.push(instance);
             return;
@@ -371,7 +463,7 @@ impl<'ctx> Frame<'ctx> {
             atlas_size,
             instances,
         });
-        self.cmds.push(DrawCmd::Sprites(source, slot));
+        self.cmds.push(make_cmd(slot));
     }
 
     fn ensure_shape_cmd(&mut self) {
@@ -641,6 +733,37 @@ impl<'ctx> Frame<'ctx> {
             }
         }
 
+        // Prepare each material-sprite run for the SAME reason: building the
+        // material's sprite-shaded pipeline and its per-run bind group both need
+        // `&mut ctx`, which cannot interleave with the live pass. Build them
+        // here and stash each run's owned bind group by slot; the pass then
+        // reads the (now built) pipeline off the material and binds the stashed
+        // group — all immutable while the pass is alive. A per-run bind group
+        // (rather than mutating the material's shared one) keeps two runs that
+        // draw different textures through one material correct in a single
+        // frame.
+        let mut material_sprite_bind_groups: Vec<Option<wgpu::BindGroup>> =
+            (0..runs.len()).map(|_| None).collect();
+        for cmd in &cmds {
+            match cmd {
+                DrawCmd::MaterialSprites(material, texture, slot) => {
+                    material_sprite_bind_groups[*slot] =
+                        ctx.prepare_material_sprite(*material, *texture);
+                }
+                // The fullscreen material pipeline is also lazy (see
+                // `Material::pipeline`); build it here, before the pass borrows
+                // `ctx`, so the pass can read the cached pipeline immutably.
+                DrawCmd::Material(material) => {
+                    let index = material.0 as usize;
+                    if index < ctx.materials.len() {
+                        let device = &ctx.device;
+                        ctx.materials[index].fullscreen_pipeline(device);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         ctx.sprites.stage(&ctx.device, &ctx.queue, &runs, ls);
 
         let mut encoder = ctx
@@ -680,9 +803,33 @@ impl<'ctx> Frame<'ctx> {
                             }
                         }
                     }
+                    DrawCmd::MaterialSprites(material, _texture, slot) => {
+                        let Some(run) = ctx.sprites.staged_run(*slot) else {
+                            continue;
+                        };
+                        // The pipeline was built in the pre-warm phase above
+                        // (needs `&mut ctx`); reading it here is a plain
+                        // immutable access while `pass` is alive. The bind group
+                        // (uniforms + this run's texture in slot 0) was stashed
+                        // by slot in the same pre-warm pass. A missing pipeline
+                        // or bind group means the run was a no-op (unknown
+                        // material/texture or no texture slot) — skip it.
+                        if let Some(m) = ctx.materials.get(material.0 as usize)
+                            && let Some(pipeline) = m.sprite_pipeline_cached()
+                            && let Some(Some(bind_group)) = material_sprite_bind_groups.get(*slot)
+                        {
+                            ctx.sprites
+                                .draw_run_with_pipeline(&mut pass, run, pipeline, bind_group);
+                        }
+                    }
                     DrawCmd::Material(mat) => {
-                        if let Some(m) = ctx.materials.get(mat.0 as usize) {
-                            pass.set_pipeline(&m.pipeline);
+                        // The pipeline was built in the pre-warm phase above
+                        // (it is lazy — see `Material::pipeline`); read the
+                        // cached one here (the pass holds `&ctx`).
+                        if let Some(m) = ctx.materials.get(mat.0 as usize)
+                            && let Some(pipeline) = m.fullscreen_pipeline_cached()
+                        {
+                            pass.set_pipeline(pipeline);
                             pass.set_bind_group(0, &m.bind_group, &[]);
                             pass.draw(0..3, 0..1);
                         }

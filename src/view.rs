@@ -107,4 +107,106 @@ mod tests {
         assert_eq!((q.x, q.y), (p.x, p.y));
         assert_eq!(v.length_scale(), 1.0);
     }
+
+    // ── The render-scaled-target clip-mapping contract ───────────────────────
+    //
+    // `View2::window(.., out_size, ..)` maps world coordinates into `out_size`
+    // OUTPUT PIXELS, and the batch's `logical_to_clip(px, py, size)` divides
+    // by `size` to reach NDC. These two must reference the SAME size, or every
+    // off-centre draw lands at the wrong NDC. The bug this pins: a frame
+    // rendering into a render-scaled (e.g. 2× SSAA) offscreen target built its
+    // view with `out = target_size` (correct) but converted to clip with
+    // `logical_size` (the swapchain's 1× size), doubling the NDC of anything
+    // off the window centre and flinging sprites/shapes off-screen. Centre
+    // content survived only because `0 * 2 == 0` — exactly why parallax motes
+    // near the camera showed while the off-centre training dummy vanished.
+
+    /// A world point at any window fraction must land at the SAME NDC whether
+    /// the target is 1× or 2× the window — provided the clip conversion uses
+    /// the target's own size (the fix), not a fixed logical size (the bug).
+    #[test]
+    fn window_view_maps_to_same_ndc_regardless_of_target_scale() {
+        // World window: centre (1000, 1000), 1600×900 wide (Y-up).
+        let top_left = Point {
+            x: 200.0,
+            y: 1450.0,
+        };
+        let size = Point {
+            x: 1600.0,
+            y: 900.0,
+        };
+        // A world point 3/4 across and 1/4 up the window (deliberately
+        // off-centre, where the doubling bug is visible).
+        let world = Point {
+            x: 200.0 + 1600.0 * 0.75,
+            y: 1450.0 - 900.0 * 0.75,
+        };
+
+        // 1× target: view out = clip size = (1600, 900).
+        let out_1x = Point {
+            x: 1600.0,
+            y: 900.0,
+        };
+        let v1 = View2::window(top_left, size, out_1x, true);
+        let p1 = v1.apply(world);
+        let ndc1 = crate::sprite::logical_to_clip(p1.x, p1.y, (1600, 900));
+
+        // 2× SSAA target: view out = clip size = (3200, 1800). The FIX makes
+        // both use the target's size; the ndc must be identical to the 1×
+        // case. (Under the bug, clip used (1600, 900) here → doubled ndc.)
+        let out_2x = Point {
+            x: 3200.0,
+            y: 1800.0,
+        };
+        let v2 = View2::window(top_left, size, out_2x, true);
+        let p2 = v2.apply(world);
+        let ndc2 = crate::sprite::logical_to_clip(p2.x, p2.y, (3200, 1800));
+
+        assert!(
+            (ndc1.0 - ndc2.0).abs() < 1e-4 && (ndc1.1 - ndc2.1).abs() < 1e-4,
+            "1× ndc {ndc1:?} != 2× ndc {ndc2:?} — clip size must match the view's out size"
+        );
+        // And that shared NDC must be on-screen (|x|,|y| ≤ 1), not the >1
+        // off-screen value the mismatch produced.
+        assert!(
+            ndc1.0.abs() <= 1.0 && ndc1.1.abs() <= 1.0,
+            "ndc {ndc1:?} off-screen"
+        );
+    }
+
+    /// The concrete failure mode, pinned directly: converting a 2×-target view
+    /// point to clip with the 1× `logical_size` (the bug) pushes an off-centre
+    /// world point PAST the clip volume (|ndc| > 1), while converting with the
+    /// matching 2× size (the fix) keeps it on-screen. Guards against a
+    /// regression that reintroduces a fixed `logical_size` in the clip path.
+    #[test]
+    fn mismatched_clip_size_pushes_offcentre_content_off_screen() {
+        let top_left = Point {
+            x: 200.0,
+            y: 1450.0,
+        };
+        let size = Point {
+            x: 1600.0,
+            y: 900.0,
+        };
+        let world = Point {
+            x: 200.0 + 1600.0 * 0.9,
+            y: 1450.0 - 900.0 * 0.5,
+        };
+        let out_2x = Point {
+            x: 3200.0,
+            y: 1800.0,
+        };
+        let v = View2::window(top_left, size, out_2x, true);
+        let p = v.apply(world);
+        // Bug: clip with logical_size (1600, 900) — off-screen.
+        let bug = crate::sprite::logical_to_clip(p.x, p.y, (1600, 900));
+        assert!(bug.0 > 1.0, "expected the bug to push x past clip: {bug:?}");
+        // Fix: clip with the target's own size (3200, 1800) — on-screen.
+        let fixed = crate::sprite::logical_to_clip(p.x, p.y, (3200, 1800));
+        assert!(
+            fixed.0.abs() <= 1.0,
+            "fix should keep x on-screen: {fixed:?}"
+        );
+    }
 }

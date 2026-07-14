@@ -109,6 +109,25 @@ pub struct Frame<'ctx> {
     /// coordinates at record time, before the pixel→clip conversion. Defaults
     /// to [`View2::identity`] (no transform).
     view: View2,
+    /// The pixel size of the render target this frame draws into — the
+    /// reference size for EVERY logical→clip conversion (`logical_to_clip`),
+    /// used by the shape/sprite/text record + stage paths INSTEAD of
+    /// [`Context::logical_size`].
+    ///
+    /// For a swapchain frame this is `targets[0]` (the reserved scene target,
+    /// created at `logical_size` by [`Context::ensure_scene`]), so it EQUALS
+    /// `logical_size` and nothing changes. For an offscreen
+    /// [`Context::begin_target_frame`] whose target was created at a size
+    /// OTHER than `logical_size` (an app's supersampled/render-scaled scene
+    /// buffer, a half-size bloom ping-pong target), this is that target's own
+    /// dimensions — so a caller that windows a world view onto the target's
+    /// real pixel extent (`View2::window(.., out = target_size, ..)`) has its
+    /// coordinates converted to clip against the SAME extent, instead of being
+    /// doubled/halved by a `logical_size` that no longer matches the
+    /// attachment. Without this, drawing into a 2× scene target placed every
+    /// off-centre sprite/shape at 2× NDC (off-screen); centre content survived
+    /// only because `0 * 2 == 0`.
+    output_size: (u32, u32),
 }
 
 impl Context {
@@ -139,6 +158,12 @@ impl Context {
         for font in &mut self.fonts {
             font.begin_frame();
         }
+        // The swapchain frame renders into the reserved scene target (index 0),
+        // created at `logical_size` — so its output size EQUALS `logical_size`
+        // and the clip conversion is unchanged. Reading it from the target
+        // (not hardcoding `logical_size`) keeps a single source of truth with
+        // the offscreen path below.
+        let output_size = self.targets[0].size();
         let scratch = std::mem::take(&mut self.frame_scratch);
         Ok(Frame {
             ctx: self,
@@ -149,6 +174,7 @@ impl Context {
             spare_instances: scratch.spare_instances,
             shape_cmd_recorded: false,
             view: View2::identity(),
+            output_size,
         })
     }
 
@@ -175,6 +201,12 @@ impl Context {
         for font in &mut self.fonts {
             font.begin_frame();
         }
+        // Clip conversions must reference THIS target's real pixel size, not
+        // `logical_size` — an app-created render-scaled/supersampled target is
+        // sized independently of `logical_size`, and mapping world coordinates
+        // against the wrong extent misplaces every off-centre draw (the SSAA
+        // scene-target sprite-invisibility bug — see `Frame::output_size`).
+        let output_size = self.targets[index].size();
         let scratch = std::mem::take(&mut self.frame_scratch);
         Ok(Frame {
             ctx: self,
@@ -185,6 +217,7 @@ impl Context {
             spare_instances: scratch.spare_instances,
             shape_cmd_recorded: false,
             view: View2::identity(),
+            output_size,
         })
     }
 }
@@ -385,7 +418,7 @@ impl<'ctx> Frame<'ctx> {
 
     /// Filled rectangle.
     pub fn fill_rect(&mut self, rect: Rect2, color: Color) {
-        let ls = self.ctx.logical_size;
+        let ls = self.output_size;
         let r = self.view_rect(rect);
         self.ctx.shapes.fill_rect(r.x, r.y, r.w, r.h, color, ls);
         self.ensure_shape_cmd();
@@ -393,7 +426,7 @@ impl<'ctx> Frame<'ctx> {
 
     /// Rectangle outline.
     pub fn rect_outline(&mut self, rect: Rect2, thickness: f32, color: Color) {
-        let ls = self.ctx.logical_size;
+        let ls = self.output_size;
         let r = self.view_rect(rect);
         let thickness = thickness * self.view.length_scale();
         self.ctx
@@ -404,7 +437,7 @@ impl<'ctx> Frame<'ctx> {
 
     /// Line segment.
     pub fn line(&mut self, from: Point, to: Point, thickness: f32, color: Color) {
-        let ls = self.ctx.logical_size;
+        let ls = self.output_size;
         let from = self.view.apply(from);
         let to = self.view.apply(to);
         let thickness = thickness * self.view.length_scale();
@@ -416,7 +449,7 @@ impl<'ctx> Frame<'ctx> {
 
     /// Filled circle.
     pub fn circle(&mut self, center: Point, radius: f32, color: Color) {
-        let ls = self.ctx.logical_size;
+        let ls = self.output_size;
         let center = self.view.apply(center);
         let radius = radius * self.view.length_scale();
         self.ctx
@@ -427,7 +460,7 @@ impl<'ctx> Frame<'ctx> {
 
     /// Circle outline.
     pub fn circle_outline(&mut self, center: Point, radius: f32, thickness: f32, color: Color) {
-        let ls = self.ctx.logical_size;
+        let ls = self.output_size;
         let center = self.view.apply(center);
         let radius = radius * self.view.length_scale();
         let thickness = thickness * self.view.length_scale();
@@ -439,7 +472,7 @@ impl<'ctx> Frame<'ctx> {
 
     /// Filled triangle.
     pub fn triangle(&mut self, a: Point, b: Point, c: Point, color: Color) {
-        let ls = self.ctx.logical_size;
+        let ls = self.output_size;
         let a = self.view.apply(a);
         let b = self.view.apply(b);
         let c = self.view.apply(c);
@@ -451,7 +484,7 @@ impl<'ctx> Frame<'ctx> {
 
     /// Draw a string in `font` at `pos` (top-left of the first line).
     pub fn text(&mut self, font: FontId, text: &str, pos: Point, style: TextStyle) {
-        let ls = self.ctx.logical_size;
+        let ls = self.output_size;
         let color = [style.color.r, style.color.g, style.color.b, style.color.a];
         let pos = self.view.apply(pos);
         let style = TextStyle {
@@ -575,8 +608,15 @@ impl<'ctx> Frame<'ctx> {
             mut spare_instances,
             shape_cmd_recorded: _,
             view: _,
+            output_size,
         } = self;
-        let ls = ctx.logical_size;
+        // Stage sprite geometry against the same output extent the record-path
+        // shape/text conversions used (`Frame::output_size`), NOT
+        // `ctx.logical_size` — for a render-scaled offscreen target the two
+        // differ, and staging sprites against `logical_size` while shapes used
+        // the target size (or vice versa) would misplace one relative to the
+        // other. Both now reference the target's real pixel size.
+        let ls = output_size;
 
         ctx.shapes.upload(&ctx.device, &ctx.queue);
         for font in &mut ctx.fonts {

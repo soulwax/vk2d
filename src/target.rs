@@ -51,7 +51,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 /// One offscreen render target and the pipeline that upscales it to a swapchain
 /// frame with Nearest filtering.
 pub(crate) struct SceneTarget {
-    #[allow(dead_code)]
     texture: Texture,
     view: TextureView,
     #[allow(dead_code)]
@@ -131,6 +130,14 @@ impl SceneTarget {
         &self.view
     }
 
+    /// The target's underlying color texture — used by the doc-hidden pixel
+    /// readback helper on [`crate::Context`] so integration tests can assert a
+    /// finished target's actual texels. Not part of the drawing path.
+    #[doc(hidden)]
+    pub(crate) fn color_texture(&self) -> &Texture {
+        &self.texture
+    }
+
     /// The Nearest sampler paired with this target's color texture. Reused so
     /// binding a target as a material input does not need a fresh sampler per
     /// bind; `TextureView`/`Sampler` are cheap reference-counted handles, so
@@ -176,7 +183,14 @@ fn create_scene_texture(device: &Device, width: u32, height: u32) -> (Texture, T
         sample_count: 1,
         dimension: TextureDimension::D2,
         format: SCENE_FORMAT,
-        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+        // COPY_SRC lets the doc-hidden pixel-readback helper on `Context`
+        // (used by integration tests to assert a finished target's texels)
+        // copy the target texture into a mappable buffer. It adds no runtime
+        // cost to the draw path and keeps the readback pointed at the real
+        // scene texture rather than a test-only copy.
+        usage: TextureUsages::RENDER_ATTACHMENT
+            | TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = texture.create_view(&TextureViewDescriptor::default());

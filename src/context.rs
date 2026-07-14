@@ -439,6 +439,70 @@ impl Context {
         (self.config.width, self.config.height)
     }
 
+    /// Read one target's texel at `(x, y)` back as `[r, g, b, a]` bytes — a
+    /// doc-hidden test hook so integration tests can assert what a finished
+    /// target actually contains (or what a `target_sprite` composite produced
+    /// when the readback target is the composite destination). Not a stable
+    /// API and not part of the drawing path; returns `None` for an unknown
+    /// target or out-of-range coordinate. Blocks on the copy + map.
+    #[doc(hidden)]
+    pub fn read_target_pixel(&self, target: TargetId, x: u32, y: u32) -> Option<[u8; 4]> {
+        let scene = self.targets.get(target.0 as usize)?;
+        let (w, h) = scene.size();
+        if x >= w || y >= h {
+            return None;
+        }
+        // wgpu requires bytes_per_row to be a multiple of 256; copy the target
+        // into a row-padded staging buffer and index the requested texel out of
+        // it. A single probe copies the whole texture rather than a sub-region
+        // to keep the copy's offset/extent alignment trivially valid.
+        let unpadded_bpr = 4 * w;
+        let padded_bpr = unpadded_bpr.div_ceil(256) * 256;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("vk2d.readback"),
+            size: (padded_bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("vk2d.readback.encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: scene.color_texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bpr),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+        let slice = buffer.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+        let data = slice.get_mapped_range();
+        let row = (y * padded_bpr) as usize;
+        let px = row + (x * 4) as usize;
+        let pixel = [data[px], data[px + 1], data[px + 2], data[px + 3]];
+        drop(data);
+        buffer.unmap();
+        Some(pixel)
+    }
+
     /// Reconfigure the surface after the window resized. A zero dimension is
     /// ignored (minimized window).
     pub fn resize(&mut self, width: u32, height: u32) {

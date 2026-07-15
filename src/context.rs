@@ -91,7 +91,9 @@ pub struct Context {
     pub(crate) materials: Vec<Material>,
     /// Vector-primitive batch (rects/lines/circles/triangles).
     pub(crate) shapes: crate::shapes::ShapeBatch,
-    /// Text renderers, indexed by `FontId` (one baked atlas each).
+    /// Text renderers, indexed by `FontId`. Each renderer lazily bakes and
+    /// caches one glyph atlas per distinct requested pixel size — see
+    /// `TextRenderer`'s own doc comment in `text.rs`.
     pub(crate) fonts: Vec<TextRenderer>,
     /// Shared 1x1 white texture substituted into any declared material
     /// texture slot that hasn't been bound yet. Built lazily on first use by
@@ -210,7 +212,7 @@ impl Context {
     pub fn measure_text(&self, font: FontId, text: &str, style: TextStyle) -> (f32, f32) {
         self.fonts
             .get(font.0 as usize)
-            .map(|f| f.measure(text, style.size))
+            .map(|f| f.measure(&self.device, &self.queue, text, style.size))
             .unwrap_or((0.0, 0.0))
     }
 
@@ -231,11 +233,11 @@ impl Context {
                 offset_y: 0.0,
             };
         };
-        let (width, height) = renderer.measure(text, style.size);
+        let (width, height) = renderer.measure(&self.device, &self.queue, text, style.size);
         TextMetricsExt {
             width,
             height,
-            offset_y: renderer.baseline_offset(style.size),
+            offset_y: renderer.baseline_offset(&self.device, &self.queue, style.size),
         }
     }
 

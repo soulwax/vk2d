@@ -583,10 +583,16 @@ impl<'ctx> Frame<'ctx> {
             size: style.size * self.view.length_scale(),
             ..style
         };
-        let Some(renderer) = self.ctx.fonts.get_mut(font.0 as usize) else {
+        let Context {
+            device,
+            queue,
+            fonts,
+            ..
+        } = &mut *self.ctx;
+        let Some(renderer) = fonts.get_mut(font.0 as usize) else {
             return;
         };
-        renderer.queue_text(text, [pos.x, pos.y], style.size, color, ls);
+        renderer.queue_text(device, queue, text, [pos.x, pos.y], style.size, color, ls);
         // Record one Text command per font (its glyphs all draw in one call).
         if !self
             .cmds

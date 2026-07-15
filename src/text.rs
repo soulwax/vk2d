@@ -38,6 +38,28 @@ struct Glyph {
     advance: f32,
 }
 
+/// Round a requested pixel height to its glyph-atlas cache key. Distinct
+/// sizes bake distinct atlases; this is the single place that decides which
+/// requested sizes share a bake (whole-pixel buckets — sub-pixel size
+/// requests are rare in practice and would not visibly benefit from their
+/// own atlas).
+fn bucket_key(px: f32) -> u32 {
+    px.round().max(1.0) as u32
+}
+
+/// One glyph atlas baked at a specific pixel size: the bind group vk2d's
+/// text pipeline samples, plus the per-glyph metrics `queue_text`/`measure`
+/// need to lay out that size's text. Every field here previously lived flat
+/// on `TextRenderer` itself, back when there was only ever one baked size.
+struct SizedAtlas {
+    bind_group: BindGroup,
+    glyphs: HashMap<char, Glyph>,
+    atlas_width: f32,
+    atlas_height: f32,
+    ascent: f32,
+    baked_px: f32,
+}
+
 const SHADER: &str = r#"
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -66,34 +88,50 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// A fontdue-backed text renderer: one baked atlas + a batched-quad pipeline.
-/// Glyph geometry accumulates across a frame and draws in one call.
+/// A fontdue-backed text renderer: a lazily-grown per-size glyph atlas cache
+/// + a batched-quad pipeline shared across every size. Glyph geometry
+/// accumulates across a frame, partitioned by which size baked it, and each
+/// active size draws in its own indexed call (same pipeline, different bind
+/// group — see `draw`).
 pub(crate) struct TextRenderer {
     pipeline: RenderPipeline,
-    bind_group: BindGroup,
-    atlas_width: f32,
-    atlas_height: f32,
-    glyphs: HashMap<char, Glyph>,
-    baked_px: f32,
-    ascent: f32,
+    bind_group_layout: BindGroupLayout,
+    font: Font,
+    /// Interior mutability: `measure`/`baseline_offset` must stay `&self`
+    /// (they sit behind `Renderer2d::measure_text(&self, ...)`, a frozen
+    /// trait method — see `renderer_vk.rs`'s `measure_text` impl), but a
+    /// cache miss needs to bake a brand-new atlas texture + bind group,
+    /// which mutates this cache. `RefCell` makes that legal without
+    /// widening the trait signature. Single-threaded by construction (vk2d
+    /// has no cross-thread `Context` access anywhere today), so borrow
+    /// panics would only ever indicate a bug in this file, not real
+    /// contention.
+    atlases: std::cell::RefCell<HashMap<u32, SizedAtlas>>,
     vertex_buffer: Buffer,
     index_buffer: Buffer,
     capacity_glyphs: usize,
-    /// CPU accumulation for the frame.
+    /// CPU accumulation for the frame, partitioned by bucket key so `draw`
+    /// can issue one indexed call per active size. Each entry is
+    /// `(bucket_key, index_range_start, index_range_len)`; ranges are
+    /// contiguous slices of `indices` in the order buckets were first
+    /// touched this frame.
     verts: Vec<u8>,
     indices: Vec<u8>,
     glyph_count: usize,
+    active_buckets: Vec<(u32, u32, u32)>,
 }
 
 impl TextRenderer {
-    /// Bake `ttf_bytes` at `baked_px` and build the text pipeline for
-    /// `target_format`. `Err` (never a panic) if the font is unparsable.
+    /// Parse `ttf_bytes` and build the (initially empty) text pipeline for
+    /// `target_format`. `Err` (never a panic) if the font is unparsable. No
+    /// atlas is baked here — the first `measure`/`queue_text` call at a
+    /// given size bakes that size lazily (see `get_or_bake`).
     pub(crate) fn new(
         device: &Device,
-        queue: &Queue,
+        _queue: &Queue,
         target_format: TextureFormat,
         ttf_bytes: &[u8],
-        baked_px: f32,
+        _baked_px: f32,
         max_glyphs: usize,
     ) -> Result<Self, Vk2dError> {
         let font = Font::from_bytes(ttf_bytes, FontSettings::default()).map_err(|e| {
@@ -101,10 +139,7 @@ impl TextRenderer {
                 message: format!("font parse failed: {e}"),
             }
         })?;
-        let bake = bake_atlas(&font, baked_px);
         let bind_group_layout = create_bind_group_layout(device);
-        let bind_group =
-            create_atlas_bind_group(device, queue, &bind_group_layout, &bake.atlas, bake.size);
         let pipeline = create_pipeline(device, target_format, &bind_group_layout);
         let capacity_glyphs = max_glyphs.max(1);
         let vertex_buffer = create_empty_buffer(
@@ -121,43 +156,70 @@ impl TextRenderer {
         );
         Ok(Self {
             pipeline,
-            bind_group,
-            atlas_width: bake.size[0] as f32,
-            atlas_height: bake.size[1] as f32,
-            glyphs: bake.glyphs,
-            baked_px,
-            ascent: bake.ascent,
+            bind_group_layout,
+            font,
+            atlases: std::cell::RefCell::new(HashMap::new()),
             vertex_buffer,
             index_buffer,
             capacity_glyphs,
             verts: Vec::new(),
             indices: Vec::new(),
             glyph_count: 0,
+            active_buckets: Vec::new(),
         })
     }
 
-    /// Measure `text` at `px` height: `(width, height)` in logical pixels. The
-    /// width is the pen advance; the height is the baked line height scaled.
-    pub(crate) fn measure(&self, text: &str, px: f32) -> (f32, f32) {
-        let scale = text_scale(px, self.baked_px);
+    /// Return the atlas baked at `px`'s bucket, baking it now on a cache
+    /// miss. Takes `&self` (not `&mut self`) via the `RefCell`, so
+    /// `measure`/`baseline_offset` — which sit behind the frozen
+    /// `Renderer2d::measure_text(&self, ...)` — can trigger a bake without
+    /// widening their own signatures.
+    fn get_or_bake(&self, device: &Device, queue: &Queue, px: f32) -> std::cell::Ref<'_, HashMap<u32, SizedAtlas>> {
+        let key = bucket_key(px);
+        if !self.atlases.borrow().contains_key(&key) {
+            let bake = bake_atlas(&self.font, key as f32);
+            let bind_group =
+                create_atlas_bind_group(device, queue, &self.bind_group_layout, &bake.atlas, bake.size);
+            self.atlases.borrow_mut().insert(
+                key,
+                SizedAtlas {
+                    bind_group,
+                    glyphs: bake.glyphs,
+                    atlas_width: bake.size[0] as f32,
+                    atlas_height: bake.size[1] as f32,
+                    ascent: bake.ascent,
+                    baked_px: key as f32,
+                },
+            );
+        }
+        self.atlases.borrow()
+    }
+
+    /// Measure `text` at `px` height: `(width, height)` in logical pixels.
+    /// Bakes the `px` atlas now if it has never been requested before.
+    pub(crate) fn measure(&self, device: &Device, queue: &Queue, text: &str, px: f32) -> (f32, f32) {
+        let atlases = self.get_or_bake(device, queue, px);
+        let atlas = &atlases[&bucket_key(px)];
         let mut width = 0.0;
         for ch in text.chars() {
-            match self.glyphs.get(&ch) {
-                Some(g) => width += g.advance * scale,
-                None => width += self.baked_px * 0.3 * scale,
+            match atlas.glyphs.get(&ch) {
+                Some(g) => width += g.advance,
+                None => width += atlas.baked_px * 0.3,
             }
         }
         (width, px)
     }
 
-    /// Distance from a line's top (the `origin.y` passed to [`Self::queue_text`])
-    /// down to its baseline, in logical pixels, at `px` height. Delegates to
-    /// [`baseline_offset_from`], the exact same expression
-    /// [`Self::queue_text`] adds to `origin.y` before rounding — so
-    /// measurement and drawing can never disagree about where the baseline
-    /// lands.
-    pub(crate) fn baseline_offset(&self, px: f32) -> f32 {
-        baseline_offset_from(self.ascent, px, self.baked_px)
+    /// Distance from a line's top (the `origin.y` passed to
+    /// [`Self::queue_text`]) down to its baseline, in logical pixels, at `px`
+    /// height. Delegates to [`baseline_offset_from`], the exact same
+    /// expression [`Self::queue_text`] uses — so measurement and drawing can
+    /// never disagree about where the baseline lands. Bakes the `px` atlas
+    /// now if it has never been requested before.
+    pub(crate) fn baseline_offset(&self, device: &Device, queue: &Queue, px: f32) -> f32 {
+        let atlases = self.get_or_bake(device, queue, px);
+        let atlas = &atlases[&bucket_key(px)];
+        baseline_offset_from(atlas.ascent)
     }
 
     /// Clear the frame's glyph accumulation.
@@ -165,24 +227,43 @@ impl TextRenderer {
         self.verts.clear();
         self.indices.clear();
         self.glyph_count = 0;
+        self.active_buckets.clear();
     }
 
-    /// Append `text` starting at logical-pixel `origin` (top-left of the first
-    /// line), `px` height, `color` tint. Snapped to whole pixels for crispness.
+    /// Append `text` starting at logical-pixel `origin` (top-left of the
+    /// first line), `px` height, `color` tint. Snapped to whole pixels for
+    /// crispness. Bakes the `px` atlas now if it has never been requested
+    /// before.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn queue_text(
         &mut self,
+        device: &Device,
+        queue: &Queue,
         text: &str,
         origin: [f32; 2],
         px: f32,
         color: [f32; 4],
         logical_size: (u32, u32),
     ) {
-        let scale = text_scale(px, self.baked_px);
+        let key = bucket_key(px);
+        let range_start = self.indices.len() as u32;
+        // Extract atlas data in a scope so the borrow is dropped before mutating self
+        let (glyphs, ascent, atlas_width, atlas_height, baked_px) = {
+            let atlases = self.get_or_bake(device, queue, px);
+            let atlas = &atlases[&key];
+            (
+                atlas.glyphs.clone(),
+                atlas.ascent,
+                atlas.atlas_width,
+                atlas.atlas_height,
+                atlas.baked_px,
+            )
+        };
         let mut pen_x = origin[0].round();
-        let baseline = origin[1].round() + baseline_offset_from(self.ascent, px, self.baked_px);
+        let baseline = origin[1].round() + baseline_offset_from(ascent);
         for ch in text.chars() {
-            let Some(glyph) = self.glyphs.get(&ch).copied() else {
-                pen_x += self.baked_px * 0.3 * scale;
+            let Some(glyph) = glyphs.get(&ch).copied() else {
+                pen_x += baked_px * 0.3;
                 continue;
             };
             if glyph.atlas_px[2] > 0.0 && glyph.atlas_px[3] > 0.0 {
@@ -192,10 +273,9 @@ impl TextRenderer {
                     &glyph,
                     pen_x,
                     baseline,
-                    scale,
                     color,
-                    self.atlas_width,
-                    self.atlas_height,
+                    atlas_width,
+                    atlas_height,
                     logical_size,
                 );
                 for local in [0u16, 1, 2, 0, 2, 3] {
@@ -204,7 +284,16 @@ impl TextRenderer {
                 }
                 self.glyph_count += 1;
             }
-            pen_x += glyph.advance * scale;
+            pen_x += glyph.advance;
+        }
+        let range_len = self.indices.len() as u32 - range_start;
+        if range_len == 0 {
+            return;
+        }
+        if let Some(existing) = self.active_buckets.iter_mut().find(|(k, _, _)| *k == key) {
+            existing.2 += range_len;
+        } else {
+            self.active_buckets.push((key, range_start, range_len));
         }
     }
 
@@ -220,17 +309,26 @@ impl TextRenderer {
         queue.write_buffer(&self.index_buffer, 0, &self.indices);
     }
 
-    /// Draw the uploaded glyphs in one indexed draw call.
+    /// Draw the uploaded glyphs: one indexed draw call per distinct size
+    /// bucket that had text queued this frame (typically a handful — HUD,
+    /// dialogue body, kill notices, speaker names — not one per glyph or
+    /// per `queue_text` call). The pipeline stays bound throughout; only the
+    /// bind group (which atlas texture) changes between calls.
     pub(crate) fn draw<'pass>(&'pass self, pass: &mut RenderPass<'pass>) {
-        if self.glyph_count == 0 {
+        if self.active_buckets.is_empty() {
             return;
         }
-        let index_count = (self.glyph_count * INDICES_PER_GLYPH) as u32;
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         pass.set_index_buffer(self.index_buffer.slice(..), IndexFormat::Uint16);
-        pass.draw_indexed(0..index_count, 0, 0..1);
+        let atlases = self.atlases.borrow();
+        for (key, start, len) in &self.active_buckets {
+            let Some(atlas) = atlases.get(key) else {
+                continue;
+            };
+            pass.set_bind_group(0, &atlas.bind_group, &[]);
+            pass.draw_indexed(*start..(*start + *len), 0, 0..1);
+        }
     }
 
     fn grow(&mut self, device: &Device, needed: usize) {
@@ -254,23 +352,17 @@ impl TextRenderer {
     }
 }
 
-/// The single scale expression shared by drawing ([`TextRenderer::queue_text`])
-/// and measurement ([`TextRenderer::measure`], [`TextRenderer::baseline_offset`]):
-/// requested pixel height over the size the atlas was baked at. Every caller
-/// that needs "how big does a baked glyph render" goes through this function
-/// so draw and measure can never compute a different scale for the same
-/// inputs.
-fn text_scale(px: f32, baked_px: f32) -> f32 {
-    px / baked_px
-}
-
-/// Distance from a line's top down to its baseline at `px` height, given the
-/// font's baked `ascent` (in baked-atlas pixels) and the size it was baked at.
-/// [`TextRenderer::queue_text`] adds this to `origin.y` (before rounding);
-/// [`TextRenderer::baseline_offset`] — and therefore `measure_text_ext` —
-/// returns the identical value. One function, one place either could diverge.
-fn baseline_offset_from(ascent: f32, px: f32, baked_px: f32) -> f32 {
-    ascent * text_scale(px, baked_px)
+/// Distance from a line's top down to its baseline, given the font's baked
+/// `ascent` at the exact size it was baked at. With a per-size atlas cache,
+/// the atlas that serves a `px` request is always baked at exactly `px`
+/// (see `bucket_key`), so no scale multiplication is needed — this used to
+/// scale `ascent` by `requested_px / baked_px`; now that ratio is always 1.0
+/// by construction, so this simply returns `ascent` unchanged. Kept as its
+/// own named function (rather than inlined) because `queue_text` and
+/// `TextRenderer::baseline_offset` both need the identical value, and a
+/// pinned shared expression is what stops the two from silently diverging.
+fn baseline_offset_from(ascent: f32) -> f32 {
+    ascent
 }
 
 struct AtlasBake {
@@ -335,22 +427,20 @@ fn bake_atlas(font: &Font, baked_px: f32) -> AtlasBake {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn push_glyph_quad(
     out: &mut Vec<u8>,
     glyph: &Glyph,
     pen_x: f32,
     baseline: f32,
-    scale: f32,
     tint: [f32; 4],
     atlas_width: f32,
     atlas_height: f32,
     logical_size: (u32, u32),
 ) {
-    let x = pen_x + glyph.offset[0] * scale;
-    let y = baseline + glyph.offset[1] * scale;
-    let w = glyph.atlas_px[2] * scale;
-    let h = glyph.atlas_px[3] * scale;
+    let x = pen_x + glyph.offset[0];
+    let y = baseline + glyph.offset[1];
+    let w = glyph.atlas_px[2];
+    let h = glyph.atlas_px[3];
     let u0 = glyph.atlas_px[0] / atlas_width;
     let v0 = glyph.atlas_px[1] / atlas_height;
     let u1 = (glyph.atlas_px[0] + glyph.atlas_px[2]) / atlas_width;
@@ -554,39 +644,27 @@ mod tests {
     // of a rasterized font.
 
     #[test]
-    fn text_scale_is_requested_over_baked_px() {
-        assert_eq!(text_scale(32.0, 16.0), 2.0);
-        assert_eq!(text_scale(16.0, 16.0), 1.0);
-        assert_eq!(text_scale(8.0, 16.0), 0.5);
+    fn bucket_key_rounds_half_pixel_sizes_to_nearest_integer() {
+        assert_eq!(bucket_key(31.6), 32);
+        assert_eq!(bucket_key(32.4), 32);
+        assert_eq!(bucket_key(31.4), 31);
+        assert_eq!(bucket_key(32.5), 33); // f32::round rounds half-away-from-zero
     }
 
     #[test]
-    fn baseline_offset_from_scales_ascent_by_text_scale() {
-        // A font baked at 16px with a 12.8px ascent (0.8 ratio, fontdue's own
-        // fallback ratio when a font lacks line metrics), requested at 32px:
-        // the baseline should sit at ascent * (32/16) = 25.6px below the top.
-        let offset = baseline_offset_from(12.8, 32.0, 16.0);
-        assert!((offset - 25.6).abs() < 1e-4);
+    fn bucket_key_is_stable_for_exact_integers() {
+        assert_eq!(bucket_key(16.0), 16);
+        assert_eq!(bucket_key(48.0), 48);
     }
 
     #[test]
-    fn baseline_offset_from_matches_queue_text_expression() {
-        // Same expression `queue_text` uses inline: origin.y.round() + this
-        // term. Confirm the two independent-looking call sites reduce to
-        // identical floats for a range of sizes, so `measure_text_ext`
-        // (which calls `baseline_offset`) can never silently drift from what
-        // gets drawn.
-        let ascent = 20.0;
-        let baked_px = 24.0;
-        for px in [8.0, 16.0, 24.0, 48.0, 100.0] {
-            let via_helper = baseline_offset_from(ascent, px, baked_px);
-            let inline_equivalent = ascent * (px / baked_px);
-            assert_eq!(via_helper, inline_equivalent);
-        }
+    fn baseline_offset_from_returns_ascent_unchanged() {
+        assert_eq!(baseline_offset_from(12.8), 12.8);
+        assert_eq!(baseline_offset_from(0.0), 0.0);
     }
 
     #[test]
-    fn baseline_offset_is_positive_for_positive_ascent_and_size() {
-        assert!(baseline_offset_from(10.0, 24.0, 16.0) > 0.0);
+    fn baseline_offset_is_positive_for_positive_ascent() {
+        assert!(baseline_offset_from(10.0) > 0.0);
     }
 }

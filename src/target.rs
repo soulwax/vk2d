@@ -223,7 +223,14 @@ fn create_bind_group_layout(device: &Device) -> BindGroupLayout {
                 binding: 0,
                 visibility: ShaderStages::FRAGMENT,
                 ty: BindingType::Texture {
-                    sample_type: TextureSampleType::Float { filterable: false },
+                    // `filterable: true` so this layout accepts either a
+                    // Nearest or a Linear sampler bound against it — Linear
+                    // is required when the target is supersampled and needs
+                    // a smooth downsample (see `SceneTarget::new` doc
+                    // comment); `Filtering` samplers are a superset that
+                    // also accept Nearest, so this is not a behavior change
+                    // for existing Nearest-filtered targets.
+                    sample_type: TextureSampleType::Float { filterable: true },
                     view_dimension: TextureViewDimension::D2,
                     multisampled: false,
                 },
@@ -232,7 +239,7 @@ fn create_bind_group_layout(device: &Device) -> BindGroupLayout {
             BindGroupLayoutEntry {
                 binding: 1,
                 visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Sampler(SamplerBindingType::NonFiltering),
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
         ],

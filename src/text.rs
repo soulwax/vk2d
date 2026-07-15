@@ -22,7 +22,7 @@ use wgpu::{
 
 use crate::Vk2dError;
 use crate::blend::BlendMode;
-use crate::sprite::logical_to_clip;
+use crate::sprite::ClipXform;
 
 const FIRST_CHAR: u32 = 0x20; // space
 const LAST_CHAR: u32 = 0x7E; // tilde
@@ -263,22 +263,30 @@ impl TextRenderer {
     ) {
         let key = bucket_key(px);
         let range_start = self.indices.len() as u32;
-        // Extract atlas data in a scope so the borrow is dropped before mutating self
-        let (glyphs, ascent, atlas_width, atlas_height, baked_px) = {
-            let atlases = self.get_or_bake(device, queue, px);
-            let atlas = &atlases[&key];
-            (
-                atlas.glyphs.clone(),
-                atlas.ascent,
-                atlas.atlas_width,
-                atlas.atlas_height,
-                atlas.baked_px,
-            )
-        };
+        // Ensure the atlas is baked (may insert into `self.atlases`), then
+        // drop that borrow immediately — `get_or_bake` takes `&self`, so its
+        // returned `Ref` ties to the WHOLE of `self`, not just `atlases`,
+        // and would otherwise conflict with the `&mut self.verts`/`indices`
+        // mutation below even though the two fields never actually overlap.
+        drop(self.get_or_bake(device, queue, px));
+        // Re-borrow `atlases` directly (not through the `&self` helper): a
+        // borrow of just this field lets the borrow checker see it is
+        // disjoint from `self.verts`/`self.indices`/`self.glyph_count`, so
+        // the loop below can read glyph metrics by reference with no clone.
+        let atlases = self.atlases.borrow();
+        let atlas = &atlases[&key];
+        let ascent = atlas.ascent;
+        let atlas_width = atlas.atlas_width;
+        let atlas_height = atlas.atlas_height;
+        let baked_px = atlas.baked_px;
         let mut pen_x = origin[0].round();
         let baseline = origin[1].round() + baseline_offset_from(ascent);
+        // One transform for every glyph in this string instead of
+        // recomputing logical_to_clip's divide per glyph corner —
+        // logical_size is constant for the whole batch.
+        let xform = ClipXform::new(logical_size);
         for ch in text.chars() {
-            let Some(glyph) = glyphs.get(&ch).copied() else {
+            let Some(glyph) = atlas.glyphs.get(&ch).copied() else {
                 pen_x += baked_px * 0.3;
                 continue;
             };
@@ -292,7 +300,7 @@ impl TextRenderer {
                     color,
                     atlas_width,
                     atlas_height,
-                    logical_size,
+                    xform,
                 );
                 for local in [0u16, 1, 2, 0, 2, 3] {
                     self.indices
@@ -302,6 +310,7 @@ impl TextRenderer {
             }
             pen_x += glyph.advance;
         }
+        drop(atlases);
         let range_len = self.indices.len() as u32 - range_start;
         if range_len == 0 {
             return;
@@ -452,7 +461,7 @@ fn push_glyph_quad(
     tint: [f32; 4],
     atlas_width: f32,
     atlas_height: f32,
-    logical_size: (u32, u32),
+    xform: ClipXform,
 ) {
     let x = pen_x + glyph.offset[0];
     let y = baseline + glyph.offset[1];
@@ -469,7 +478,7 @@ fn push_glyph_quad(
         (x, y + h, u0, v1),
     ];
     for (px, py, u, v) in corners {
-        let (ndc_x, ndc_y) = logical_to_clip(px, py, logical_size);
+        let (ndc_x, ndc_y) = xform.apply(px, py);
         out.extend_from_slice(&ndc_x.to_le_bytes());
         out.extend_from_slice(&ndc_y.to_le_bytes());
         out.extend_from_slice(&u.to_le_bytes());

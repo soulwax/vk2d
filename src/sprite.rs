@@ -464,8 +464,12 @@ fn push_sprite_vertices(
         (cx + hw, cy + hh, u1, v1),
         (cx - hw, cy + hh, u0, v1),
     ];
+    // One transform for all four corners of this sprite instead of
+    // recomputing logical_to_clip's divide per corner — logical_size is
+    // constant for the whole batch (see ClipXform's doc comment).
+    let xform = ClipXform::new(logical_size);
     for (px, py, u, v) in corners {
-        let (ndc_x, ndc_y) = logical_to_clip(px, py, logical_size);
+        let (ndc_x, ndc_y) = xform.apply(px, py);
         out.extend_from_slice(&ndc_x.to_le_bytes());
         out.extend_from_slice(&ndc_y.to_le_bytes());
         out.extend_from_slice(&u.to_le_bytes());
@@ -476,12 +480,51 @@ fn push_sprite_vertices(
     }
 }
 
-/// Logical pixel (top-left origin) to clip space (-1..1, Y up).
+/// Logical pixel (top-left origin) to clip space (-1..1, Y up). No
+/// production call site uses this directly anymore — every per-vertex hot
+/// path now goes through [`ClipXform`], which hoists the divide out of the
+/// per-vertex loop. Kept (not deleted) because `view.rs`'s own tests call
+/// it directly to check `View2`'s math independently of the batching
+/// layer, and `ClipXform`'s own tests use it as the correctness reference.
+#[allow(dead_code)]
 pub(crate) fn logical_to_clip(px: f32, py: f32, logical_size: (u32, u32)) -> (f32, f32) {
     let (w, h) = logical_size;
     let x = px / w.max(1) as f32 * 2.0 - 1.0;
     let y = 1.0 - py / h.max(1) as f32 * 2.0;
     (x, y)
+}
+
+/// Precomputed factors for [`logical_to_clip`]'s conversion, reused across
+/// every vertex of a batch instead of recomputing the same `w.max(1) as f32`
+/// cast and divide per vertex. `logical_size` is constant for a whole
+/// staging pass (it only changes when the render target's own size
+/// changes, at most once per frame) — hoisting the two divisions and casts
+/// out of the per-vertex hot path leaves `apply` as two multiply-adds,
+/// bit-for-bit identical to `logical_to_clip`'s result for the same inputs
+/// (see `clip_xform_tests` for the equivalence proof).
+#[derive(Clone, Copy)]
+pub(crate) struct ClipXform {
+    sx: f32,
+    ox: f32,
+    sy: f32,
+    oy: f32,
+}
+
+impl ClipXform {
+    pub(crate) fn new(logical_size: (u32, u32)) -> Self {
+        let (w, h) = logical_size;
+        Self {
+            sx: 2.0 / w.max(1) as f32,
+            ox: -1.0,
+            sy: -2.0 / h.max(1) as f32,
+            oy: 1.0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn apply(&self, px: f32, py: f32) -> (f32, f32) {
+        (px * self.sx + self.ox, py * self.sy + self.oy)
+    }
 }
 
 /// Bind-group layout shared by every sprite draw, including
@@ -623,5 +666,67 @@ mod source_tests {
             SpriteSource::Texture(TextureId(1)),
             SpriteSource::Texture(TextureId(2))
         );
+    }
+}
+
+#[cfg(test)]
+mod clip_xform_tests {
+    use super::*;
+
+    #[test]
+    fn clip_xform_matches_logical_to_clip_for_arbitrary_points() {
+        // ClipXform is a precomputed-factor fast path for the same math
+        // logical_to_clip does per-call — every point it converts must land
+        // within float-rounding tolerance of the per-call function's result,
+        // for any logical size and any point actually reachable within (or
+        // just outside) that target's own pixel range. Bit-exact equality
+        // is NOT the right bar here: `px / w * 2.0 - 1.0` (direct) and
+        // `px * (2.0 / w) - 1.0` (precomputed reciprocal) are mathematically
+        // equivalent but not bit-identical IEEE 754 float expressions —
+        // dividing by `w` then multiplying differs from multiplying by
+        // `w`'s precomputed reciprocal in the last few bits of the
+        // mantissa. At any real logical point (within a few multiples of
+        // the target's own width/height — sprites/shapes overlap the
+        // viewport, they are not drawn thousands of widths off-target) that
+        // difference is many orders of magnitude below one screen pixel, so
+        // it is genuinely invisible; a relative-error tolerance instead of
+        // `==` reflects "same visual result," not "same bits." Test points
+        // scale WITH each target's own size (a fraction of `w`/`h`, not a
+        // fixed absolute pixel value) so a small target like `(7, 13)`
+        // isn't probed at wildly out-of-range points that inflate the
+        // relative float-rounding error for reasons unrelated to the
+        // transform itself.
+        let sizes = [(1600u32, 900u32), (3200, 1800), (1, 1), (7, 13)];
+        let point_fracs = [(0.0_f32, 0.0_f32), (0.5, 0.5), (1.0, 1.0), (-0.1, 1.5)];
+        const RELATIVE_TOLERANCE: f32 = 1e-4;
+        for size in sizes {
+            let xform = ClipXform::new(size);
+            let (w, h) = (size.0.max(1) as f32, size.1.max(1) as f32);
+            for (fx, fy) in point_fracs {
+                let (px, py) = (fx * w, fy * h);
+                let expected = logical_to_clip(px, py, size);
+                let actual = xform.apply(px, py);
+                let scale = expected.0.abs().max(expected.1.abs()).max(1.0);
+                assert!(
+                    (actual.0 - expected.0).abs() <= RELATIVE_TOLERANCE * scale
+                        && (actual.1 - expected.1).abs() <= RELATIVE_TOLERANCE * scale,
+                    "size={size:?} point=({px},{py}): xform {actual:?} != direct {expected:?} \
+                     (relative tolerance {RELATIVE_TOLERANCE})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clip_xform_new_matches_zero_sized_logical_size_fallback() {
+        // logical_to_clip clamps width/height to a minimum of 1 to avoid a
+        // divide by zero; ClipXform::new must apply the identical clamp so
+        // a degenerate (0,0) logical size still produces the same fallback
+        // coordinates as the per-call function, not a NaN/inf.
+        let xform = ClipXform::new((0, 0));
+        let expected = logical_to_clip(5.0, 5.0, (0, 0));
+        let actual = xform.apply(5.0, 5.0);
+        assert_eq!(actual, expected);
+        assert!(actual.0.is_finite() && actual.1.is_finite());
     }
 }

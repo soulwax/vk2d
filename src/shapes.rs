@@ -15,7 +15,7 @@ use wgpu::{
 
 use crate::blend::BlendMode;
 use crate::color::Color;
-use crate::sprite::logical_to_clip;
+use crate::sprite::ClipXform;
 
 /// Bytes per vertex: position (2×f32) + colour (4×f32).
 const VERTEX_STRIDE: BufferAddress = 24;
@@ -102,13 +102,17 @@ impl ShapeBatch {
         self.indices.clear();
     }
 
-    fn push_vertex(&mut self, px: f32, py: f32, color: Color, logical_size: (u32, u32)) {
-        let (x, y) = logical_to_clip(px, py, logical_size);
+    fn push_vertex(&mut self, px: f32, py: f32, color: Color, xform: ClipXform) {
+        let (x, y) = xform.apply(px, py);
         self.verts
             .extend_from_slice(&[x, y, color.r, color.g, color.b, color.a]);
     }
 
-    /// Add a filled triangle (logical pixels).
+    /// Add a filled triangle (logical pixels). Builds the clip-space
+    /// transform once per triangle (three vertices) instead of once per
+    /// vertex — `logical_size` is constant for the whole batch, so the
+    /// per-vertex divide `logical_to_clip` used to redo is redundant work
+    /// `ClipXform::new` hoists out to a single cheap construction.
     fn push_triangle_px(
         &mut self,
         a: (f32, f32),
@@ -117,10 +121,11 @@ impl ShapeBatch {
         color: Color,
         logical_size: (u32, u32),
     ) {
+        let xform = ClipXform::new(logical_size);
         let base = (self.verts.len() / 6) as u16;
-        self.push_vertex(a.0, a.1, color, logical_size);
-        self.push_vertex(b.0, b.1, color, logical_size);
-        self.push_vertex(c.0, c.1, color, logical_size);
+        self.push_vertex(a.0, a.1, color, xform);
+        self.push_vertex(b.0, b.1, color, xform);
+        self.push_vertex(c.0, c.1, color, xform);
         self.indices.extend_from_slice(&[base, base + 1, base + 2]);
     }
 

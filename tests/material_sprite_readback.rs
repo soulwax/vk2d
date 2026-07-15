@@ -87,7 +87,7 @@ fn run_assertions(ctx: &mut Context) {
         })
         .expect("passthrough material compiles");
 
-    let dst = ctx.create_target(LOGICAL.0, LOGICAL.1);
+    let dst = ctx.create_target(LOGICAL.0, LOGICAL.1, wgpu::FilterMode::Nearest);
     let clear = Color {
         r: 0.05,
         g: 0.05,
@@ -131,7 +131,7 @@ fn run_assertions(ctx: &mut Context) {
     // green readback can only have come from the material's `fs_main`.
     let white = [255u8; 16]; // 2x2 opaque white
     let white_tex = ctx.load_texture_rgba(&white, 2, 2, Filter::Nearest);
-    let dst2 = ctx.create_target(LOGICAL.0, LOGICAL.1);
+    let dst2 = ctx.create_target(LOGICAL.0, LOGICAL.1, wgpu::FilterMode::Nearest);
     {
         ctx.set_material_uniform(mat, "tint", UniformValue::Vec4(0.0, 1.0, 0.0, 1.0));
         let mut f = ctx.begin_target_frame(dst2, clear).unwrap();

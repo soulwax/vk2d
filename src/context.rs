@@ -389,25 +389,30 @@ impl Context {
         id
     }
 
-    /// Create a `width`x`height` offscreen render target. Draw into it with
-    /// [`Context::begin_target_frame`], then sample it as a material input with
-    /// [`crate::Frame::bind_material_target`] or present it via the swapchain.
+    /// Create a `width`x`height` offscreen render target, sampled with
+    /// `filter` when read back (via [`crate::Frame::target_sprite`] or as a
+    /// material input). Draw into it with [`Context::begin_target_frame`].
     ///
     /// The default scene target (index 0) is reserved first, so a target you
     /// create always has index ≥ 1 and can never alias the scene the swapchain
     /// path renders into — creating a target before your first frame is safe.
-    pub fn create_target(&mut self, width: u32, height: u32) -> TargetId {
+    pub fn create_target(&mut self, width: u32, height: u32, filter: wgpu::FilterMode) -> TargetId {
         // Reserve targets[0] for the scene before appending an app target, so an
         // app-created target never lands at index 0 (which begin_frame renders
         // into and blits — sampling it would be a self-usage conflict).
         self.ensure_scene();
-        self.push_target(width, height)
+        self.push_target(width, height, filter)
     }
 
     /// Append a target and return its id, without reserving the scene target.
     /// The raw builder shared by `create_target` and `ensure_scene`.
-    pub(crate) fn push_target(&mut self, width: u32, height: u32) -> TargetId {
-        let target = SceneTarget::new(&self.device, width, height, self.config.format);
+    pub(crate) fn push_target(
+        &mut self,
+        width: u32,
+        height: u32,
+        filter: wgpu::FilterMode,
+    ) -> TargetId {
+        let target = SceneTarget::new(&self.device, width, height, self.config.format, filter);
         let id = TargetId(self.targets.len() as u32);
         self.targets.push(target);
         // Kept parallel to `targets`: `target_sprite`'s bind-group cache is

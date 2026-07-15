@@ -66,16 +66,22 @@ pub(crate) struct SceneTarget {
 }
 
 impl SceneTarget {
-    /// Create a `width`x`height` offscreen target whose blit pipeline outputs to
-    /// `surface_format`.
+    /// Create a `width`x`height` offscreen target whose blit pipeline outputs
+    /// to `surface_format`, sampled with `filter` (`Nearest` keeps pixel art
+    /// crisp at native resolution; `Linear` is needed when this target is
+    /// supersampled and will be downsampled back down — a `Nearest`
+    /// downsample of a supersampled buffer drops every other texel row/
+    /// column, visible as scanline stripes; `Linear` lets the hardware
+    /// average texels during the shrink instead).
     pub(crate) fn new(
         device: &Device,
         width: u32,
         height: u32,
         surface_format: TextureFormat,
+        filter: FilterMode,
     ) -> Self {
         let (texture, view) = create_scene_texture(device, width, height);
-        let sampler = create_nearest_sampler(device);
+        let sampler = create_sampler(device, filter);
         let bind_group_layout = create_bind_group_layout(device);
         let bind_group = create_bind_group(device, &bind_group_layout, &view, &sampler);
         let blit_pipeline = create_blit_pipeline(device, surface_format, &bind_group_layout);
@@ -197,14 +203,14 @@ fn create_scene_texture(device: &Device, width: u32, height: u32) -> (Texture, T
     (texture, view)
 }
 
-fn create_nearest_sampler(device: &Device) -> Sampler {
+fn create_sampler(device: &Device, filter: FilterMode) -> Sampler {
     device.create_sampler(&SamplerDescriptor {
-        label: Some("vk2d.scene.nearest_sampler"),
+        label: Some("vk2d.scene.sampler"),
         address_mode_u: AddressMode::ClampToEdge,
         address_mode_v: AddressMode::ClampToEdge,
         address_mode_w: AddressMode::ClampToEdge,
-        mag_filter: FilterMode::Nearest,
-        min_filter: FilterMode::Nearest,
+        mag_filter: filter,
+        min_filter: filter,
         ..Default::default()
     })
 }

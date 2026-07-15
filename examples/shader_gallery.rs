@@ -594,7 +594,7 @@ impl ApplicationHandler for App {
                             .expect("context initialized before first redraw")
                             // Full logical size so the post shaders sample the
                             // demo scene 1:1 instead of stretching a small target.
-                            .create_target(LOGICAL.0, LOGICAL.1)
+                            .create_target(LOGICAL.0, LOGICAL.1, wgpu::FilterMode::Nearest)
                     });
                     self.render_demo_scene(target, t);
                 }

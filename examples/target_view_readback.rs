@@ -97,11 +97,13 @@ impl ApplicationHandler for App {
         let (cx, cy) = (LOGICAL.0 / 2, LOGICAL.1 / 2);
 
         // Two source targets: one drawn under identity, one under a Y-up view.
-        let src_ident: TargetId = ctx.create_target(LOGICAL.0, LOGICAL.1);
-        let src_view: TargetId = ctx.create_target(LOGICAL.0, LOGICAL.1);
+        let src_ident: TargetId =
+            ctx.create_target(LOGICAL.0, LOGICAL.1, wgpu::FilterMode::Nearest);
+        let src_view: TargetId = ctx.create_target(LOGICAL.0, LOGICAL.1, wgpu::FilterMode::Nearest);
         // Two readback destinations for the target_sprite composite.
-        let dst_ident: TargetId = ctx.create_target(LOGICAL.0, LOGICAL.1);
-        let dst_view: TargetId = ctx.create_target(LOGICAL.0, LOGICAL.1);
+        let dst_ident: TargetId =
+            ctx.create_target(LOGICAL.0, LOGICAL.1, wgpu::FilterMode::Nearest);
+        let dst_view: TargetId = ctx.create_target(LOGICAL.0, LOGICAL.1, wgpu::FilterMode::Nearest);
 
         // Draw a SMALL marker at a known source position into each target. A
         // full-cover fill would mask any positioning bug, so use a small rect
@@ -158,8 +160,8 @@ impl ApplicationHandler for App {
         // target_sprite (Nearest). Mirrors the game's supersampled scene → screen
         // composite. Probe the target centre (full-cover fill so any content is
         // visible — here we test the downscale sampling path, not positioning).
-        let ss = ctx.create_target(LOGICAL.0 * 2, LOGICAL.1 * 2);
-        let ss_dst = ctx.create_target(LOGICAL.0, LOGICAL.1);
+        let ss = ctx.create_target(LOGICAL.0 * 2, LOGICAL.1 * 2, wgpu::FilterMode::Nearest);
+        let ss_dst = ctx.create_target(LOGICAL.0, LOGICAL.1, wgpu::FilterMode::Nearest);
         {
             let mut f = ctx.begin_target_frame(ss, Color::BLACK).unwrap();
             f.set_view(y_up_view(w * 2.0, h * 2.0));

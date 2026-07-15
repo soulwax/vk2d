@@ -63,10 +63,10 @@ fn run_assertions(ctx: &mut Context) {
     let (w, h) = (LOGICAL.0 as f32, LOGICAL.1 as f32);
     let (cx, cy) = (LOGICAL.0 / 2, LOGICAL.1 / 2);
 
-    let src_ident = ctx.create_target(LOGICAL.0, LOGICAL.1);
-    let src_view = ctx.create_target(LOGICAL.0, LOGICAL.1);
-    let dst_ident = ctx.create_target(LOGICAL.0, LOGICAL.1);
-    let dst_view = ctx.create_target(LOGICAL.0, LOGICAL.1);
+    let src_ident = ctx.create_target(LOGICAL.0, LOGICAL.1, wgpu::FilterMode::Nearest);
+    let src_view = ctx.create_target(LOGICAL.0, LOGICAL.1, wgpu::FilterMode::Nearest);
+    let dst_ident = ctx.create_target(LOGICAL.0, LOGICAL.1, wgpu::FilterMode::Nearest);
+    let dst_view = ctx.create_target(LOGICAL.0, LOGICAL.1, wgpu::FilterMode::Nearest);
 
     // A small marker near the top of source space. Under identity it stays at
     // the top (y≈40); under the Y-up flip it lands near the bottom (y≈140).
@@ -133,8 +133,8 @@ fn run_assertions(ctx: &mut Context) {
     // Supersampled downscale: a 2x source drawn Y-up, composited DOWN to the
     // dest size via target_sprite (Nearest) — the game's SSAA scene→screen
     // shape. A full-cover fill so the centre probe tests the sampling path.
-    let ss = ctx.create_target(LOGICAL.0 * 2, LOGICAL.1 * 2);
-    let ss_dst = ctx.create_target(LOGICAL.0, LOGICAL.1);
+    let ss = ctx.create_target(LOGICAL.0 * 2, LOGICAL.1 * 2, wgpu::FilterMode::Nearest);
+    let ss_dst = ctx.create_target(LOGICAL.0, LOGICAL.1, wgpu::FilterMode::Nearest);
     {
         let mut f = ctx.begin_target_frame(ss, Color::BLACK).unwrap();
         f.set_view(y_up_view(w * 2.0, h * 2.0));

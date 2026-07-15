@@ -150,7 +150,7 @@ impl Context {
     pub(crate) fn ensure_scene(&mut self) -> usize {
         if self.targets.is_empty() {
             let (w, h) = self.logical_size;
-            self.push_target(w, h);
+            self.push_target(w, h, wgpu::FilterMode::Nearest);
         }
         0
     }

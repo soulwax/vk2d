@@ -16,6 +16,11 @@ winit = "0.30"
 pollster = "0.4"
 naga = { version = "29", features = ["wgsl-in", "spv-out"] }
 fontdue = "0.9"
+# Reinterprets a Vec<f32>/Vec<u16> geometry buffer as &[u8] for
+# queue.write_buffer without a per-element to_le_bytes()/extend_from_slice
+# copy loop. Widely used, no unsafe in consumer code (the crate's own cast
+# functions are the only unsafe, audited upstream).
+bytemuck = "1"
 
 # Optional integrations, off by default so the core crate's dependency surface
 # stays small.

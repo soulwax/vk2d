@@ -63,8 +63,10 @@ pub(crate) struct ShapeBatch {
     /// CPU-side accumulation for this frame (cleared after upload).
     verts: Vec<f32>,
     indices: Vec<u16>,
-    /// Reused upload scratch; keeps peak geometry capacity across frames.
-    vertex_bytes: Vec<u8>,
+    /// Reused upload scratch for the index buffer's alignment padding (see
+    /// `upload`'s doc comment) — keeps peak capacity across frames. The
+    /// vertex buffer no longer needs an equivalent scratch: `verts` itself
+    /// is byte-cast directly via `bytemuck::cast_slice` at upload time.
     index_bytes: Vec<u8>,
 }
 
@@ -91,7 +93,6 @@ impl ShapeBatch {
             capacity_verts,
             verts: Vec::new(),
             indices: Vec::new(),
-            vertex_bytes: Vec::new(),
             index_bytes: Vec::new(),
         }
     }
@@ -245,21 +246,24 @@ impl ShapeBatch {
         if vert_count > self.capacity_verts {
             self.grow(device, vert_count);
         }
-        self.vertex_bytes.clear();
-        self.vertex_bytes
-            .reserve(self.verts.len().saturating_mul(std::mem::size_of::<f32>()));
-        for value in &self.verts {
-            self.vertex_bytes.extend_from_slice(&value.to_le_bytes());
-        }
+        // `bytemuck::cast_slice` reinterprets the already-contiguous
+        // Vec<f32>/Vec<u16> as &[u8] directly — no per-element
+        // to_le_bytes()/extend_from_slice copy loop, and no scratch
+        // vertex_bytes buffer needed at all (index_bytes is still needed
+        // below, for the alignment padding cast_slice can't add). This
+        // assumes a little-endian target, which the crate already did
+        // implicitly (the code this replaces called `to_le_bytes()`
+        // unconditionally); every platform vk2d ships to today is
+        // little-endian.
+        let vertex_bytes: &[u8] = bytemuck::cast_slice(&self.verts);
         self.index_bytes.clear();
         self.index_bytes.reserve(
             self.indices
                 .len()
                 .saturating_mul(std::mem::size_of::<u16>()),
         );
-        for index in &self.indices {
-            self.index_bytes.extend_from_slice(&index.to_le_bytes());
-        }
+        self.index_bytes
+            .extend_from_slice(bytemuck::cast_slice(&self.indices));
         // `write_buffer` requires the source length to be a multiple of
         // COPY_BUFFER_ALIGNMENT (4). u16 indices are 2 bytes each, so an ODD
         // index count yields a 2-mod-4 length and wgpu rejects the copy. Pad to
@@ -269,7 +273,7 @@ impl ShapeBatch {
         while !self.index_bytes.len().is_multiple_of(4) {
             self.index_bytes.push(0);
         }
-        queue.write_buffer(&self.vertex_buffer, 0, &self.vertex_bytes);
+        queue.write_buffer(&self.vertex_buffer, 0, vertex_bytes);
         queue.write_buffer(&self.index_buffer, 0, &self.index_bytes);
     }
 
@@ -384,3 +388,77 @@ fn create_empty_buffer(
 // `ShapeBatch` would need a GPU `Device` (the batch owns a pipeline). The pure
 // clip-space mapping it relies on (`sprite::logical_to_clip`) is covered where
 // it is defined.
+
+#[cfg(test)]
+mod upload_byte_cast_tests {
+    // `upload()` itself needs a real GPU Device/Queue and so cannot run
+    // headless (see the comment above), but the property it depends on —
+    // that bytemuck::cast_slice(&verts_or_indices) produces the exact same
+    // bytes the old per-element to_le_bytes()/extend_from_slice loop did —
+    // is a pure, GPU-free claim. These tests pin that equivalence directly,
+    // so a future bytemuck upgrade or refactor can't silently reintroduce a
+    // byte-order/layout mismatch between the fast path and what wgpu
+    // actually expects (little-endian, tightly packed, no padding between
+    // elements — exactly what to_le_bytes()/extend_from_slice produced).
+
+    fn to_le_bytes_loop_f32(values: &[f32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+
+    fn to_le_bytes_loop_u16(values: &[u16]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * 2);
+        for value in values {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn cast_slice_matches_to_le_bytes_loop_for_f32_vertices() {
+        let verts: Vec<f32> = vec![
+            -1.0,
+            1.0,
+            0.0,
+            0.5,
+            1.0,
+            0.25, // one vertex's worth of fields
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            f32::MIN,
+            f32::MAX,
+            -0.0,
+            0.0,
+            12345.678,
+            -98_765.43,
+        ];
+        let expected = to_le_bytes_loop_f32(&verts);
+        let actual: &[u8] = bytemuck::cast_slice(&verts);
+        assert_eq!(actual, expected.as_slice());
+    }
+
+    #[test]
+    fn cast_slice_matches_to_le_bytes_loop_for_u16_indices() {
+        let indices: Vec<u16> = vec![0, 1, 2, 0, 2, 3, u16::MAX, u16::MIN, 12345];
+        let expected = to_le_bytes_loop_u16(&indices);
+        let actual: &[u8] = bytemuck::cast_slice(&indices);
+        assert_eq!(actual, expected.as_slice());
+    }
+
+    #[test]
+    fn cast_slice_of_empty_slice_is_empty() {
+        let empty_f32: &[f32] = &[];
+        let empty_u16: &[u16] = &[];
+        let cast_f32: &[u8] = bytemuck::cast_slice(empty_f32);
+        let cast_u16: &[u8] = bytemuck::cast_slice(empty_u16);
+        assert!(cast_f32.is_empty());
+        assert!(cast_u16.is_empty());
+    }
+}

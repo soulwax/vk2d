@@ -484,6 +484,15 @@ pub(crate) fn logical_to_clip(px: f32, py: f32, logical_size: (u32, u32)) -> (f3
     (x, y)
 }
 
+/// Bind-group layout shared by every sprite draw, including
+/// [`crate::Frame::target_sprite`]'s render-target readback.
+///
+/// Declared `Filtering`-capable so `target_sprite`'s readback (which may
+/// source a `Linear`-filtered supersampled [`crate::SceneTarget`]) validates;
+/// ordinary `Nearest`-filtered sprite textures also validate fine against a
+/// `Filtering` layout, so this is a widening with no behavior change for
+/// existing callers — see `target.rs`'s twin fix in the same task for the
+/// parallel blit-path layout.
 fn create_bind_group_layout(device: &Device) -> BindGroupLayout {
     device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("vk2d.sprite.bind_group_layout"),
@@ -492,7 +501,7 @@ fn create_bind_group_layout(device: &Device) -> BindGroupLayout {
                 binding: 0,
                 visibility: ShaderStages::FRAGMENT,
                 ty: BindingType::Texture {
-                    sample_type: TextureSampleType::Float { filterable: false },
+                    sample_type: TextureSampleType::Float { filterable: true },
                     view_dimension: TextureViewDimension::D2,
                     multisampled: false,
                 },
@@ -501,7 +510,7 @@ fn create_bind_group_layout(device: &Device) -> BindGroupLayout {
             BindGroupLayoutEntry {
                 binding: 1,
                 visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Sampler(SamplerBindingType::NonFiltering),
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
                 count: None,
             },
         ],

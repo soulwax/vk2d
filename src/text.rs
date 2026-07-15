@@ -89,10 +89,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 "#;
 
 /// A fontdue-backed text renderer: a lazily-grown per-size glyph atlas cache
-/// + a batched-quad pipeline shared across every size. Glyph geometry
+/// plus a batched-quad pipeline shared across every size. Glyph geometry
 /// accumulates across a frame, partitioned by which size baked it, and each
 /// active size draws in its own indexed call (same pipeline, different bind
-/// group — see `draw`).
+/// group; see `draw`).
 pub(crate) struct TextRenderer {
     pipeline: RenderPipeline,
     bind_group_layout: BindGroupLayout,
@@ -174,12 +174,22 @@ impl TextRenderer {
     /// `measure`/`baseline_offset` — which sit behind the frozen
     /// `Renderer2d::measure_text(&self, ...)` — can trigger a bake without
     /// widening their own signatures.
-    fn get_or_bake(&self, device: &Device, queue: &Queue, px: f32) -> std::cell::Ref<'_, HashMap<u32, SizedAtlas>> {
+    fn get_or_bake(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        px: f32,
+    ) -> std::cell::Ref<'_, HashMap<u32, SizedAtlas>> {
         let key = bucket_key(px);
         if !self.atlases.borrow().contains_key(&key) {
             let bake = bake_atlas(&self.font, key as f32);
-            let bind_group =
-                create_atlas_bind_group(device, queue, &self.bind_group_layout, &bake.atlas, bake.size);
+            let bind_group = create_atlas_bind_group(
+                device,
+                queue,
+                &self.bind_group_layout,
+                &bake.atlas,
+                bake.size,
+            );
             self.atlases.borrow_mut().insert(
                 key,
                 SizedAtlas {
@@ -197,7 +207,13 @@ impl TextRenderer {
 
     /// Measure `text` at `px` height: `(width, height)` in logical pixels.
     /// Bakes the `px` atlas now if it has never been requested before.
-    pub(crate) fn measure(&self, device: &Device, queue: &Queue, text: &str, px: f32) -> (f32, f32) {
+    pub(crate) fn measure(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        text: &str,
+        px: f32,
+    ) -> (f32, f32) {
         let atlases = self.get_or_bake(device, queue, px);
         let atlas = &atlases[&bucket_key(px)];
         let mut width = 0.0;
@@ -427,6 +443,7 @@ fn bake_atlas(font: &Font, baked_px: f32) -> AtlasBake {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_glyph_quad(
     out: &mut Vec<u8>,
     glyph: &Glyph,

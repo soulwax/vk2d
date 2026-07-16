@@ -562,6 +562,20 @@ impl<'ctx> Frame<'ctx> {
         self.ensure_shape_cmd();
     }
 
+    /// Filled ellipse. `radii` are the x/y semi-axes (a size pair, like
+    /// `SpriteParams.dest_size` in the parent crate), `rotation` is radians
+    /// about `center`.
+    pub fn ellipse(&mut self, center: Point, radii: Point, rotation: f32, color: Color) {
+        let ls = self.output_size;
+        let center = self.view.apply(center);
+        let rx = radii.x * self.view.length_scale();
+        let ry = radii.y * self.view.length_scale();
+        self.ctx
+            .shapes
+            .ellipse(center.x, center.y, rx, ry, rotation, color, ls);
+        self.ensure_shape_cmd();
+    }
+
     /// Filled triangle.
     pub fn triangle(&mut self, a: Point, b: Point, c: Point, color: Color) {
         let ls = self.output_size;

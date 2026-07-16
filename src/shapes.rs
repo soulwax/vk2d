@@ -224,6 +224,37 @@ impl ShapeBatch {
         }
     }
 
+    /// Filled ellipse (triangle fan). `rx`/`ry` are independent horizontal/
+    /// vertical semi-axes; `rotation` is radians about the centre, applied to
+    /// each fan point before translation — the same triangle-fan approach as
+    /// `circle`, generalized to non-uniform scale + rotation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ellipse(
+        &mut self,
+        cx: f32,
+        cy: f32,
+        rx: f32,
+        ry: f32,
+        rotation: f32,
+        color: Color,
+        logical_size: (u32, u32),
+    ) {
+        let (sin_r, cos_r) = rotation.sin_cos();
+        let point_at = |unit: (f32, f32)| -> (f32, f32) {
+            // unit is (sin(angle), cos(angle)) per UNIT_CIRCLE's storage
+            // order (see circle()'s use of pair.1 for x, pair.0 for y).
+            let (ux, uy) = (unit.1 * rx, unit.0 * ry);
+            let x = ux * cos_r - uy * sin_r;
+            let y = ux * sin_r + uy * cos_r;
+            (cx + x, cy + y)
+        };
+        for pair in UNIT_CIRCLE.windows(2) {
+            let p0 = point_at(pair[0]);
+            let p1 = point_at(pair[1]);
+            self.push_triangle_px((cx, cy), p0, p1, color, logical_size);
+        }
+    }
+
     /// Filled triangle (public verb).
     pub(crate) fn triangle(
         &mut self,

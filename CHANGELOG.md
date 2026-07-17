@@ -6,6 +6,16 @@ All notable changes to vk2d are documented in this file.
 
 Release type: PATCH
 
+- Fixed uploaded textures (`Context::load_texture_rgba`) and the shared 1x1
+  white fallback texture being created with an sRGB GPU format
+  (`Rgba8UnormSrgb`) instead of the crate's linear convention
+  (`SCENE_FORMAT` / `Rgba8Unorm`, already used by every render target). Every
+  fragment shader in this crate treats a sampled texel as an already-final,
+  display-ready color; the sRGB format made the GPU silently decode
+  sRGB->linear on every `textureSample`, darkening sprite colors with no
+  compensating re-encode anywhere downstream. Added a live-GPU regression
+  test (`tests/texture_color_space.rs`) that uploads a known mid-range RGBA
+  color and asserts a sampled read-back reproduces it unchanged.
 - Added a doc-hidden `Context::read_target_pixel` GPU read-back helper and gave
   scene targets `COPY_SRC` usage, so integration tests can assert what a
   finished render target actually contains. No change to the drawing path.

@@ -389,7 +389,13 @@ pub(crate) fn create_gpu_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8UnormSrgb,
+        // Linear, matching `SCENE_FORMAT` (see `target.rs`): every fragment
+        // shader in this crate treats a sampled texel as an already-final,
+        // display-ready color and uses it directly. An sRGB-formatted source
+        // texture would make the GPU decode sRGB->linear on every
+        // `textureSample`, silently darkening every uploaded sprite with no
+        // compensating re-encode anywhere in the read path.
+        format: crate::target::SCENE_FORMAT,
         usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         view_formats: &[],
     });

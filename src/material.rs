@@ -604,7 +604,12 @@ pub(crate) fn create_fallback_texture(device: &Device, queue: &Queue) -> (Textur
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8UnormSrgb,
+        // Linear, matching `SCENE_FORMAT` and `sprite.rs::create_gpu_texture`
+        // — the same "no gamma anywhere" convention. An opaque-white texel is
+        // sRGB/linear-encoding-invariant, so this specific value never showed
+        // the bug, but a mismatched fallback format still risked drift if a
+        // future fallback color were ever not pure white/black.
+        format: crate::target::SCENE_FORMAT,
         usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         view_formats: &[],
     });

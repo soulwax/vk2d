@@ -152,11 +152,24 @@ impl Context {
             .await
             .map_err(|e| Vk2dError::DeviceRequest(e.to_string()))?;
 
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, size.width, size.height)
             .ok_or_else(|| {
                 Vk2dError::SurfaceCreation("adapter does not support this surface".to_string())
             })?;
+        // Force a non-sRGB surface format. The scene target and every draw
+        // pipeline write already-final display-ready bytes (this crate does
+        // no linear-space lighting), matching how every color/uniform is
+        // authored by consumers. Most adapters default to an sRGB swapchain
+        // format (`Bgra8UnormSrgb` on this machine); a pipeline whose color
+        // target is sRGB-formatted has wgpu/the GPU auto-encode its fragment
+        // output on write, which the scene's already-encoded bytes do not
+        // expect — a second, unwanted gamma pass that washes out shadows and
+        // dark/lit contrast game-wide (most visible wherever a scene has a
+        // strong light-vs-dark boundary, e.g. lantern pools against a night
+        // storm). `remove_srgb_suffix()` is a no-op if the format was already
+        // linear.
+        config.format = config.format.remove_srgb_suffix();
         surface.configure(&device, &config);
 
         // Sprites and shapes render into the scene target, so they target the

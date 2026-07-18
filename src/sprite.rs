@@ -14,9 +14,10 @@ use wgpu::{
     PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState, PrimitiveTopology, Queue,
     RenderPass, RenderPipeline, RenderPipelineDescriptor, Sampler, SamplerBindingType,
     SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, TexelCopyBufferLayout,
-    TexelCopyTextureInfo, TextureAspect, TextureDescriptor, TextureDimension, TextureFormat,
-    TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor, TextureViewDimension,
-    VertexAttribute, VertexBufferLayout, VertexFormat, VertexState, VertexStepMode,
+    TexelCopyTextureInfo, Texture, TextureAspect, TextureDescriptor, TextureDimension,
+    TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor,
+    TextureViewDimension, VertexAttribute, VertexBufferLayout, VertexFormat, VertexState,
+    VertexStepMode,
 };
 
 use crate::blend::BlendMode;
@@ -150,6 +151,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 /// consumers (materials, see `crate::material`) can rebind it into their own
 /// bind-group layouts without recreating the texture.
 pub(crate) struct GpuTexture {
+    /// The GPU texture handle, kept so its pixels can be overwritten in
+    /// place (`Context::update_texture_rgba`) — a video/frame-stream needs
+    /// to re-upload every frame without reallocating the texture, view,
+    /// bind group, or sampler.
+    pub texture: Texture,
     pub bind_group: BindGroup,
     pub width: f32,
     pub height: f32,
@@ -439,6 +445,7 @@ pub(crate) fn create_gpu_texture(
         ],
     });
     GpuTexture {
+        texture,
         bind_group,
         width: width as f32,
         height: height as f32,

@@ -402,6 +402,56 @@ impl Context {
         id
     }
 
+    /// Overwrite the pixels of an existing texture in place, without
+    /// reallocating it (its GPU handle, view, bind group, and sampler are
+    /// unchanged). `bytes` must be tightly-packed RGBA8 of exactly
+    /// `width * height * 4` bytes, and `width`/`height` must match the
+    /// texture's existing size — this is for constant-size frame streams
+    /// (e.g. the studio intro cinematic), not resizing. On a size mismatch
+    /// or unknown id, logs and no-ops (the previous contents stay), matching
+    /// the crate's degrade-never-panic contract. Mirrors what Macroquad's
+    /// `Texture2D::update` does.
+    pub fn update_texture_rgba(&mut self, id: TextureId, bytes: &[u8], width: u32, height: u32) {
+        let Some(gpu) = self.textures.get(id.0 as usize) else {
+            eprintln!("[vk2d] update_texture_rgba: unknown texture id {}", id.0);
+            return;
+        };
+        if gpu.width as u32 != width || gpu.height as u32 != height {
+            eprintln!(
+                "[vk2d] update_texture_rgba: size mismatch (texture is {}x{}, got {width}x{height}) — skipping",
+                gpu.width as u32, gpu.height as u32
+            );
+            return;
+        }
+        let expected = (width as usize) * (height as usize) * 4;
+        if bytes.len() != expected {
+            eprintln!(
+                "[vk2d] update_texture_rgba: byte length {} != expected {expected} — skipping",
+                bytes.len()
+            );
+            return;
+        }
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &gpu.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
     /// Create a `width`x`height` offscreen render target, sampled with
     /// `filter` when read back (via [`crate::Frame::target_sprite`] or as a
     /// material input). Draw into it with [`Context::begin_target_frame`].

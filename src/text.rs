@@ -463,8 +463,15 @@ fn push_glyph_quad(
     atlas_height: f32,
     xform: ClipXform,
 ) {
-    let x = pen_x + glyph.offset[0];
-    let y = baseline + glyph.offset[1];
+    // Snap each glyph to the logical-pixel grid at emission time. `pen_x`
+    // accumulates fontdue's REAL (fractional) advances — keeping the string's
+    // total width correct and matching `measure` — but emitting quads at
+    // fractional positions makes every glyph snap independently under the
+    // atlas's Nearest sampler, which reads as uneven letter spacing /
+    // "mis-pixeled" text (worst at small sizes). Rounding only here keeps
+    // layout math exact while every drawn texel lands on the pixel grid.
+    let x = (pen_x + glyph.offset[0]).round();
+    let y = (baseline + glyph.offset[1]).round();
     let w = glyph.atlas_px[2];
     let h = glyph.atlas_px[3];
     let u0 = glyph.atlas_px[0] / atlas_width;
@@ -692,5 +699,55 @@ mod tests {
     #[test]
     fn baseline_offset_is_positive_for_positive_ascent() {
         assert!(baseline_offset_from(10.0) > 0.0);
+    }
+
+    /// Fractional pen positions (fontdue advances are real-valued) must snap
+    /// to the logical-pixel grid at quad emission: un-snapped glyphs land on
+    /// fractional pixels and snap independently under the atlas's Nearest
+    /// sampler, which reads as uneven letter spacing ("mis-pixeled" text).
+    /// The first emitted vertex's NDC x must correspond to the ROUNDED
+    /// logical x, byte-identical to emitting at the integer position.
+    #[test]
+    fn push_glyph_quad_snaps_fractional_pen_to_pixel_grid() {
+        let glyph = Glyph {
+            atlas_px: [0.0, 0.0, 8.0, 8.0],
+            offset: [0.0, 0.0],
+            advance: 7.6,
+        };
+        let xform = crate::sprite::ClipXform::new((100, 100));
+
+        let mut fractional = Vec::new();
+        push_glyph_quad(
+            &mut fractional,
+            &glyph,
+            10.4, // fractional pen_x, as after one advance of 10.4
+            20.0,
+            [1.0; 4],
+            64.0,
+            64.0,
+            xform,
+        );
+        let mut integer = Vec::new();
+        push_glyph_quad(
+            &mut integer,
+            &glyph,
+            10.0, // the rounded position
+            20.0,
+            [1.0; 4],
+            64.0,
+            64.0,
+            xform,
+        );
+        assert_eq!(
+            fractional, integer,
+            "a 10.4px pen must emit the identical quad as a 10.0px pen"
+        );
+
+        // And .5 rounds AWAY from the lower pixel (f32::round), not toward it.
+        let mut half = Vec::new();
+        push_glyph_quad(&mut half, &glyph, 10.5, 20.0, [1.0; 4], 64.0, 64.0, xform);
+        let mut eleven = Vec::new();
+        push_glyph_quad(&mut eleven, &glyph, 11.0, 20.0, [1.0; 4], 64.0, 64.0, xform);
+        assert_eq!(half, eleven, "10.5px must snap to 11.0px");
     }
 }

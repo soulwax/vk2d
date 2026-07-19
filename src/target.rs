@@ -105,10 +105,17 @@ impl SceneTarget {
 
     /// Begin the scene pass: clears the target to `clear` and returns a render
     /// pass to draw the world into. The pass ends when dropped.
+    ///
+    /// `timestamp_writes` lets the caller attach a GPU timer's begin/end
+    /// timestamp query indices to this pass (see `crate::gpu_timer`); pass
+    /// `None` for any pass that should not be timed (e.g. non-primary scene
+    /// passes) — GPU timing is opt-in and only meaningful around the one pass
+    /// that carries substantially all of a frame's GPU cost.
     pub(crate) fn begin_scene_pass<'pass>(
         &'pass self,
         encoder: &'pass mut CommandEncoder,
         clear: Color,
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'pass>>,
     ) -> RenderPass<'pass> {
         encoder.begin_render_pass(&RenderPassDescriptor {
             label: Some("vk2d.scene.pass"),
@@ -123,7 +130,7 @@ impl SceneTarget {
             })],
             depth_stencil_attachment: None,
             occlusion_query_set: None,
-            timestamp_writes: None,
+            timestamp_writes,
             multiview_mask: None,
         })
     }

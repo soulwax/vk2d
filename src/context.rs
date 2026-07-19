@@ -109,6 +109,9 @@ pub struct Context {
     pub(crate) target_sprite_bind_groups: Vec<Option<wgpu::BindGroup>>,
     /// CPU command/run storage recycled by successive immediate-mode frames.
     pub(crate) frame_scratch: FrameScratch,
+    /// Per-frame GPU timer (adapter-gated). `None` when TIMESTAMP_QUERY is
+    /// unsupported — `last_gpu_frame_ms` then always returns `None`.
+    pub(crate) gpu_timer: Option<crate::gpu_timer::GpuFrameTimer>,
 }
 
 impl Context {
@@ -147,8 +150,17 @@ impl Context {
         let info = adapter.get_info();
         let adapter_info = format!("{} ({:?}, {:?})", info.name, info.backend, info.device_type);
 
+        // Request TIMESTAMP_QUERY when the adapter supports it, so the GPU
+        // frame timer (below) can measure per-frame GPU time. Absent support,
+        // fall back to the default (no features) — GPU timing is simply
+        // unavailable, everything else works.
+        let timestamps_supported = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let mut device_desc = DeviceDescriptor::default();
+        if timestamps_supported {
+            device_desc.required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
         let (device, queue) = adapter
-            .request_device(&DeviceDescriptor::default())
+            .request_device(&device_desc)
             .await
             .map_err(|e| Vk2dError::DeviceRequest(e.to_string()))?;
 
@@ -177,6 +189,12 @@ impl Context {
         let sprites = SpriteBatch::new(&device, SCENE_FORMAT);
         let shapes = crate::shapes::ShapeBatch::new(&device, SCENE_FORMAT);
 
+        let gpu_timer = if timestamps_supported {
+            crate::gpu_timer::GpuFrameTimer::new(&device, queue.get_timestamp_period())
+        } else {
+            None
+        };
+
         Ok(Self {
             device,
             queue,
@@ -193,6 +211,7 @@ impl Context {
             fallback_texture: None,
             target_sprite_bind_groups: Vec::new(),
             frame_scratch: FrameScratch::default(),
+            gpu_timer,
         })
     }
 
@@ -548,6 +567,15 @@ impl Context {
     /// device type) — useful for logging and diagnostics.
     pub fn adapter_info(&self) -> &str {
         &self.adapter_info
+    }
+
+    /// The most recent completed per-frame GPU time in milliseconds, or
+    /// `None` when GPU timing is unavailable (adapter lacks TIMESTAMP_QUERY)
+    /// or no measurement has landed yet. Non-blocking: advances the async
+    /// timestamp readback. Call once per frame (e.g. right after `present`).
+    pub fn last_gpu_frame_ms(&mut self) -> Option<f32> {
+        let device = self.device.clone();
+        self.gpu_timer.as_mut().and_then(|t| t.poll_ms(&device))
     }
 
     /// The current swapchain size in physical pixels.

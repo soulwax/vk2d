@@ -791,9 +791,14 @@ impl<'ctx> Frame<'ctx> {
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("vk2d.frame.encoder"),
             });
+        // Timestamp writes for the scene pass, if the GPU timer is active.
+        // Taken before the pass borrows `ctx.targets` so there's no
+        // overlapping borrow of `ctx`.
+        let scene_timestamp_writes = ctx.gpu_timer.as_ref().map(|t| t.timestamp_writes());
         {
             let scene: &SceneTarget = &ctx.targets[target_index];
-            let mut pass = scene.begin_scene_pass(&mut encoder, wgpu_color(clear));
+            let mut pass =
+                scene.begin_scene_pass(&mut encoder, wgpu_color(clear), scene_timestamp_writes);
             for cmd in &cmds {
                 match cmd {
                     DrawCmd::Shapes => ctx.shapes.draw(&mut pass),
@@ -861,6 +866,16 @@ impl<'ctx> Frame<'ctx> {
                     }
                 }
             }
+        }
+
+        // Resolve the scene pass's timestamps (if timed) now that the pass
+        // has dropped — the pass held `scene_timestamp_writes`, which
+        // borrowed `ctx.gpu_timer` immutably; that borrow ends with the pass,
+        // so `ctx.gpu_timer` can be borrowed mutably here. Must happen before
+        // `queue.submit` so the resolve rides the same command buffer as the
+        // timestamp writes.
+        if let Some(timer) = ctx.gpu_timer.as_mut() {
+            timer.resolve(&mut encoder);
         }
 
         let surface_texture = match dest {

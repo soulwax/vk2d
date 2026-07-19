@@ -18,6 +18,7 @@ mod context;
 mod egui_overlay;
 mod error;
 mod frame;
+mod gpu_timer;
 mod handles;
 #[cfg(feature = "winit-input")]
 mod input;
